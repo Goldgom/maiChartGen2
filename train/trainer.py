@@ -441,8 +441,13 @@ class RotatingMultiStageTrainer:
 
         stage_cycle = cycle(self.stages)
         pbar = None
-        if tqdm is not None and max_turns is not None:
-            pbar = tqdm(total=max_turns, initial=self.global_turn, desc="turns", dynamic_ncols=True)
+        # pbar: epoch 模式下按样本数显示，turn 模式下按 turn 数显示
+        if tqdm is not None:
+            if max_epochs is not None:
+                total_samples = sum(stage_dataset_size.values())
+                pbar = tqdm(total=total_samples, initial=0, desc="epoch", unit="samp", dynamic_ncols=True)
+            elif max_turns is not None:
+                pbar = tqdm(total=max_turns, initial=self.global_turn, desc="turns", dynamic_ncols=True)
 
         while True:
             if max_turns is not None and self.global_turn >= max_turns:
@@ -473,20 +478,24 @@ class RotatingMultiStageTrainer:
             train_metric_value = stats.get(self.best_metric)
 
             if pbar is not None:
-                pbar.update(1)
+                if max_epochs is not None:
+                    # epoch 模式：按当前 epoch 内的样本进度更新
+                    ep_done = sum(
+                        stage_dataset_size.get(s.name, 0) * stage_epoch.get(s.name, 0)
+                        for s in self.stages
+                    )
+                    ep_current = sum(stage_samples_seen.values())
+                    pbar.n = min(ep_done + ep_current, pbar.total)
+                else:
+                    pbar.update(1)
                 loss_value = float(stats.get("loss", float("nan")))
                 postfix = {
                     "stage": stage.name,
                     "loss": f"{loss_value:.4f}",
                     "ppl": f"{torch.exp(torch.tensor(loss_value)).item():.2f}" if torch.isfinite(torch.tensor(loss_value)) else "nan",
-                    "turn": f"{self.global_turn}/{max_turns}" if max_turns is not None else str(self.global_turn),
                 }
                 if stage.name in stage_epoch:
-                    postfix["ep"] = str(stage_epoch[stage.name])
-                if self.last_checkpoint is not None:
-                    postfix["last"] = self.last_checkpoint.name
-                if self.best_checkpoint is not None:
-                    postfix["best"] = self.best_checkpoint.name
+                    postfix["ep"] = f"{stage_epoch[stage.name]}/{max_epochs}" if max_epochs else str(stage_epoch[stage.name])
                 pbar.set_postfix(postfix)
 
             # ── 日志 ──

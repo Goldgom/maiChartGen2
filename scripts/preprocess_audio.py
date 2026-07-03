@@ -44,7 +44,7 @@ def parse_bpm(text: str) -> float:
     return 150.0
 
 
-def extract_one(folder: Path, subdiv: int = 64, sr: int = 22050) -> dict[str, Any]:
+def extract_one(folder: Path, subdiv: int = 64, sr: int = 22050, encodec_layers: int = 1) -> dict[str, Any]:
     """提取单曲音频特征 + EnCodec tokens。"""
     name = folder.name
     audio_path = folder / "track.mp3"
@@ -69,9 +69,8 @@ def extract_one(folder: Path, subdiv: int = 64, sr: int = 22050) -> dict[str, An
     audio_tokens = None
     try:
         from Tokenizer.MaiTrackTokenizer import MaiTrackTokenizer
-        n_layers = args.encodec_layers
-        etok = MaiTrackTokenizer(n_layers=n_layers, device="cpu")
-        audio_tokens = etok.encode(str(audio_path), n_layers=n_layers,
+        etok = MaiTrackTokenizer(n_layers=encodec_layers, device="cpu")
+        audio_tokens = etok.encode(str(audio_path), n_layers=encodec_layers,
                                    add_bos=False, add_eos=False, interleave=False)
     except Exception:
         pass  # EnCodec 失败不影响其他特征
@@ -136,7 +135,7 @@ def main():
     ok = fail = 0
     if args.num_workers > 1:
         with ThreadPoolExecutor(max_workers=args.num_workers) as ex:
-            fut = {ex.submit(extract_one, f, args.subdiv): f for f in folders}
+            fut = {ex.submit(extract_one, f, args.subdiv, 22050, args.encodec_layers): f for f in folders}
             for fu in as_completed(fut):
                 r = fu.result()
                 if "error" in r:
@@ -148,7 +147,7 @@ def main():
     else:
         for i, f in enumerate(folders):
             logger.info(f"[{i+1}/{len(folders)}] {f.name}")
-            r = extract_one(f, args.subdiv)
+            r = extract_one(f, args.subdiv, 22050, args.encodec_layers)
             if "error" in r:
                 logger.warning(f"  ✗ {r['error']}"); fail += 1
             else:

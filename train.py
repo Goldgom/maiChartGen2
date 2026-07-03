@@ -292,6 +292,27 @@ def main():
     stage_label = args.train_stage or "all"
     print_dataset_info(cache_root, prefix=stage_label)
 
+    # ── 训练配置摘要 ──
+    import logging
+    log = logging.getLogger(__name__)
+    log.info("=" * 60)
+    log.info("训练配置摘要")
+    log.info("=" * 60)
+    for s in stages:
+        train_n = len(s.train_loader.dataset)
+        val_n = len(s.val_loader.dataset) if s.val_loader else 0
+        samples_per_epoch = train_n
+        turns_per_epoch = max(1, samples_per_epoch // max(1, s.turn_batches * max(1, int(cfg["train"].get("batch_size", 1)))))
+        log.info(
+            "  %s: train=%d samples  val=%d samples  ~%d turns/epoch",
+            s.name, train_n, val_n, turns_per_epoch,
+        )
+    if max_epochs:
+        log.info("  训练模式: epoch (%d epochs)", max_epochs)
+    elif max_turns:
+        log.info("  训练模式: turn (%d max turns)", max_turns)
+    log.info("=" * 60)
+
     # ── 确定训练上限 ──
     if args.max_turns is not None:
         max_turns = args.max_turns
