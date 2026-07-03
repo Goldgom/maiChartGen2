@@ -632,62 +632,104 @@ class MaiGenerator(nn.Module):
             return {"logits": logits, "loss": loss, "hidden_states": x}
 
     @torch.no_grad()
-    def generate(self, onset, chroma, centroid, bpm=173.0, level=10.0, genre=0, max_steps=2048, temperature=1.0, top_k=50, audio_tokens=None):
+    def generate(self, onset, chroma, centroid, bpm=173.0, level=10.0, genre=0, max_steps=2048, temperature=1.0, top_k=50, audio_tokens=None, window_size: int = 1024):
+        """Autoregressive generation with sliding context window for O(W²) per step.
+
+        Args:
+            window_size: Max context tokens to keep (default 1024). Use 0 for full context.
+        """
         device = next(self.parameters()).device
         if onset.dim() == 1:
             onset = onset.unsqueeze(0); chroma = chroma.unsqueeze(0); centroid = centroid.unsqueeze(0)
         onset = onset.to(device); chroma = chroma.to(device); centroid = centroid.to(device)
 
-        # 一次性计算 cond 和 audio_memory
         cond = self.cond_embed(torch.tensor([[bpm, level, genre]], device=device, dtype=torch.float32))
         audio_memory = self.audio(onset, chroma, centroid, audio_tokens=audio_tokens).fused_memory  # [1, T_audio, D]
 
         generated = [self.bos_token_id]
-        # 增量追踪最后事件位置 (用于 O(1) 距离计算)
         lp = lh = ls = lt = -1
+        # 增量缓存距离 [step, 4]，每步只追加
+        cached_dist = torch.zeros(1, 0, 4, dtype=torch.long, device=device)
+        ws = window_size if window_size > 0 else max_steps
 
         for step in range(max_steps):
-            T_cur = len(generated)
-            tokens = torch.tensor([generated], device=device)
+            T_all = len(generated)
 
-            # 增量计算最后 token 的距离
-            dist_t = [
-                T_cur - 1 - lp if lp >= 0 else 0,
-                T_cur - 1 - lh if lh >= 0 else 0,
-                T_cur - 1 - ls if ls >= 0 else 0,
-                T_cur - 1 - lt if lt >= 0 else 0,
-            ]
+            # O(1) 增量距离
+            dist_t = torch.tensor([[
+                T_all - 1 - lp if lp >= 0 else 0,
+                T_all - 1 - lh if lh >= 0 else 0,
+                T_all - 1 - ls if ls >= 0 else 0,
+                T_all - 1 - lt if lt >= 0 else 0,
+            ]], device=device)
+            cached_dist = torch.cat([cached_dist, dist_t.unsqueeze(1)], dim=1)
 
-            if step == 0:
-                distances = torch.tensor([dist_t], device=device).unsqueeze(0)
+            # ── 滑动窗口 ──
+            if T_all > ws:
+                win_start = T_all - ws
+                win_tokens = generated[win_start:]
+                win_pos = torch.arange(win_start, T_all, device=device).unsqueeze(0)
+                win_dist = cached_dist[:, win_start:, :]
+                mem = audio_memory[:, win_start:T_all, :]
+                if mem.size(1) < len(win_tokens):
+                    mem = torch.cat([mem, mem[:, -1:, :].expand(1, len(win_tokens) - mem.size(1), -1)], dim=1)
+                mem = mem[:, :len(win_tokens), :]
             else:
-                # 拼接历史距离 + 新 token 距离
-                new_dist = torch.tensor([dist_t], device=device).unsqueeze(0)  # [1, 1, 4]
-                distances = torch.cat([prev_distances, new_dist], dim=1)
+                win_tokens = generated
+                win_pos = torch.arange(T_all, device=device).unsqueeze(0)
+                win_dist = cached_dist
+                mem = audio_memory[:, :T_all, :]
+                if mem.size(1) < T_all:
+                    mem = torch.cat([mem, mem[:, -1:, :].expand(1, T_all - mem.size(1), -1)], dim=1)
+                mem = mem[:, :T_all, :]
 
-            pos = torch.arange(T_cur, device=device).unsqueeze(0)
-            x = self.token_embed(tokens) + self.pos_embed(pos) + self.timing_embed(distances)
-            memory = audio_memory[:, :T_cur, :] if audio_memory.size(1) >= T_cur \
-                else torch.cat([audio_memory, audio_memory[:, -1:, :].expand(1, T_cur - audio_memory.size(1), -1)], dim=1)
-            mask = torch.triu(torch.ones((T_cur, T_cur), device=device, dtype=torch.bool), diagonal=1)
+            win_len = len(win_tokens)
+            tokens = torch.tensor([win_tokens], device=device)
+            x = self.token_embed(tokens) + self.pos_embed(win_pos) + self.timing_embed(win_dist)
+
+            mask = torch.triu(
+                torch.full((win_len, win_len), float("-inf"), device=device),
+                diagonal=1,
+            )
             for layer in self.layers:
-                x = layer(x, memory, cond, mask)
+                x = layer(x, mem, cond, mask)
 
             logits = self.lm_head(x[:, -1, :]) / temperature
+
+            # ── REST 偏差 ──
+            # top notes ≈ 8-9, REST ≈ -3, 差距 ≈ 12
+            logits[0, 16] += 12.0
+
+            # ── 音频结束引导 ──
+            audio_len = audio_memory.size(1)
+            # ~50% 是 REST，实际有效 token ≈ audio_len * 0.5
+            expected_max_tokens = int(audio_len * 0.55)
+            if T_all > expected_max_tokens:
+                overrun = T_all - expected_max_tokens
+                progress = min(overrun / expected_max_tokens, 1.0)
+                logits[0, 16] += progress * 5.0
+                logits[0, 2] += max(0, progress - 0.3) * 10.0
+                if overrun > expected_max_tokens * 0.5:
+                    logits[0, 2] += 50.0
+
             if top_k > 0:
-                v, _ = torch.topk(logits, top_k)
-                logits[logits < v[:, -1:]] = float("-inf")
+                v2, _ = torch.topk(logits, top_k)
+                logits[logits < v2[:, -1:]] = float("-inf")
             next_tok = torch.multinomial(torch.softmax(logits, dim=-1), 1).item()
             generated.append(next_tok)
 
-            lp, lh, ls, lt = _track_event_pos(next_tok, T_cur - 1, lp, lh, ls, lt)
-            prev_distances = distances
+            lp, lh, ls, lt = _track_event_pos(next_tok, T_all - 1, lp, lh, ls, lt)
+
+            if step % 512 == 0:
+                print(f"    [generate] step {step+1}/{max_steps}, tokens={len(generated)}", flush=True)
 
             if next_tok == self.eos_token_id:
+                print(f"    [generate] EOS at step {step+1}, total tokens={len(generated)}", flush=True)
                 break
 
         if not generated or generated[-1] != self.eos_token_id:
             generated.append(self.eos_token_id)
+            print(f"    [generate] max_steps reached, total tokens={len(generated)}", flush=True)
         return generated
 
     @torch.no_grad()
