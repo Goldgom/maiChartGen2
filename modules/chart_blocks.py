@@ -70,6 +70,13 @@ class CausalPathBlock(nn.Module):
         r = x
         x = self.norm3(x)
         x = self.ffn(x) + r
+
+        # ── 数值保护：NaN/inf 替换为 0，防止后续层放大 ──
+        if not torch.isfinite(x).all():
+            x = torch.nan_to_num(x, nan=0.0, posinf=1e4, neginf=-1e4)
+            # 对极端值做软 clamp
+            x = torch.clamp(x, min=-1e4, max=1e4)
+
         return x
 
 

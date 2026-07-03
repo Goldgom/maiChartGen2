@@ -101,7 +101,7 @@ class RotatingMultiStageTrainer:
         self.precision = precision
         self.log_every = log_every
         self.eval_every_turns = eval_every_turns
-        self.save_every_turns = max(1, int(save_every_turns))
+        self.save_every_turns = int(save_every_turns)  # 0 = 仅 epoch 时保存
         self.checkpoint_dir = Path(checkpoint_dir)
         self.keep_last = keep_last
         self.best_metric = best_metric
@@ -421,7 +421,7 @@ class RotatingMultiStageTrainer:
                 stage.steps_done = int(sp.get("steps_done", 0))
                 stage.turns_done = int(sp.get("turns_done", 0))
 
-    def fit(self, max_turns: int | None = None, max_steps: int | None = None) -> None:
+    def fit(self, max_turns: int | None = None, max_steps: int | None = None, max_epochs: int | None = None) -> None:
         # torch.compile 必须在 load 之后调用
         if getattr(self, "_compile_models", False):
             import logging
@@ -432,21 +432,46 @@ class RotatingMultiStageTrainer:
                 except Exception:
                     pass
 
+        # ── Epoch 跟踪 ──
+        stage_epoch: dict[str, int] = {s.name: 0 for s in self.stages}
+        stage_samples_seen: dict[str, int] = {s.name: 0 for s in self.stages}
+        stage_dataset_size: dict[str, int] = {
+            s.name: len(s.train_loader.dataset) for s in self.stages
+        }
+
         stage_cycle = cycle(self.stages)
         pbar = None
         if tqdm is not None and max_turns is not None:
             pbar = tqdm(total=max_turns, initial=self.global_turn, desc="turns", dynamic_ncols=True)
+
         while True:
             if max_turns is not None and self.global_turn >= max_turns:
                 break
             if max_steps is not None and self.global_step >= max_steps:
                 break
+            if max_epochs is not None:
+                if all(e >= max_epochs for e in stage_epoch.values()):
+                    break
+
             stage = next(stage_cycle)
             stats = self._train_turn(stage)
-            metric_value = stats.get(self.best_metric)
-            best_updated = False
-            if metric_value is not None and torch.isfinite(torch.tensor(metric_value)):
-                best_updated = self._update_best(float(metric_value))
+
+            # ── Epoch 跟踪 ──
+            epoch_completed = False
+            samples_this_turn = stage.turn_batches * max(1, int(
+                self.cfg.get("train", {}).get("batch_size", 1)
+            )) if self.cfg else stage.turn_batches
+            if stage.name in stage_samples_seen:
+                stage_samples_seen[stage.name] += samples_this_turn
+                ds_size = stage_dataset_size.get(stage.name, 1)
+                if ds_size > 0 and stage_samples_seen[stage.name] >= ds_size:
+                    stage_epoch[stage.name] += 1
+                    stage_samples_seen[stage.name] %= ds_size
+                    stage.iterator = cycle(stage.train_loader)
+                    epoch_completed = True
+
+            train_metric_value = stats.get(self.best_metric)
+
             if pbar is not None:
                 pbar.update(1)
                 loss_value = float(stats.get("loss", float("nan")))
@@ -456,38 +481,73 @@ class RotatingMultiStageTrainer:
                     "ppl": f"{torch.exp(torch.tensor(loss_value)).item():.2f}" if torch.isfinite(torch.tensor(loss_value)) else "nan",
                     "turn": f"{self.global_turn}/{max_turns}" if max_turns is not None else str(self.global_turn),
                 }
+                if stage.name in stage_epoch:
+                    postfix["ep"] = str(stage_epoch[stage.name])
                 if self.last_checkpoint is not None:
                     postfix["last"] = self.last_checkpoint.name
                 if self.best_checkpoint is not None:
                     postfix["best"] = self.best_checkpoint.name
                 pbar.set_postfix(postfix)
+
+            # ── 日志 ──
             if self.global_turn % self.log_every == 0:
                 msg = ", ".join(f"{k}={v:.4f}" for k, v in stats.items())
-                save_state = "best" if best_updated else "last"
-                print(f"[turn {self.global_turn} | step {self.global_step} | {save_state}] {stage.name}: {msg}")
-                # 写入 CSV 日志
+                ep_str = f"ep={stage_epoch.get(stage.name, 0)}" if stage.name in stage_epoch else ""
+                print(f"[turn {self.global_turn} | step {self.global_step} | {ep_str}] {stage.name}: {msg}")
                 loss_val = float(stats.get("loss", float("nan")))
                 ppl_val = torch.exp(torch.tensor(loss_val)).item() if torch.isfinite(torch.tensor(loss_val)) else float("nan")
                 self._log_writer.writerow([
                     datetime.now().isoformat(), self.global_turn, self.global_step,
                     stage.name, f"{loss_val:.6f}", f"{ppl_val:.4f}",
-                    f"{metric_value:.6f}" if metric_value is not None else "",
-                    save_state,
+                    f"{train_metric_value:.6f}" if train_metric_value is not None else "",
+                    "",
                 ])
                 self._log_file.flush()
-            if self.eval_every_turns and self.global_turn % self.eval_every_turns == 0:
+
+            # ── 验证 + Best Model 判断 ──
+            # 触发条件: epoch 完成时必然验证，或在 eval_every_turns 周期
+            best_updated = False
+            periodic_eval = (
+                self.eval_every_turns > 0
+                and self.global_turn % self.eval_every_turns == 0
+            )
+            should_validate = epoch_completed or periodic_eval
+            if should_validate:
                 val = self._validate(stage)
                 if val:
                     msg = ", ".join(f"{k}={v:.4f}" for k, v in val.items())
-                    print(f"[val  {self.global_turn} | step {self.global_step}] {stage.name}: {msg}")
-            if self.global_turn % self.save_every_turns == 0 or self.global_turn == max_turns:
+                    tag = "epoch" if epoch_completed else "val"
+                    print(f"[{tag} {stage_epoch.get(stage.name, 0)} | turn {self.global_turn} | step {self.global_step}] {stage.name}: {msg}")
+                    # 用验证集指标判断 best
+                    val_metric = val.get("val_loss", val.get(self.best_metric))
+                    if val_metric is not None and torch.isfinite(torch.tensor(val_metric)):
+                        best_updated = self._update_best(float(val_metric))
+                elif epoch_completed:
+                    # epoch 完成但无验证集：回退用训练 loss
+                    if train_metric_value is not None and torch.isfinite(torch.tensor(train_metric_value)):
+                        best_updated = self._update_best(float(train_metric_value))
+
+            # ── 保存 ──
+            periodic_save = (
+                self.save_every_turns > 0
+                and self.global_turn % self.save_every_turns == 0
+            )
+            save_this_turn = (
+                epoch_completed
+                or periodic_save
+                or self.global_turn == max_turns
+            )
+            if save_this_turn:
                 if getattr(self, "_pending_best", False):
                     self.best_checkpoint = self.save(self._checkpoint_name(stage, "best"))
                     self._pending_best = False
+                    if epoch_completed:
+                        ep = stage_epoch.get(stage.name, 0)
+                        print(f"[epoch {ep}] 💾 best saved: {self.best_checkpoint}")
                 self.last_checkpoint = self.save(self._checkpoint_name(stage, "last"))
+
         if pbar is not None:
             pbar.close()
-        # 等待所有异步保存完成，避免进程退出时 daemon 线程被杀死导致文件损坏
         self._wait_saves()
 
     def _wait_saves(self) -> None:

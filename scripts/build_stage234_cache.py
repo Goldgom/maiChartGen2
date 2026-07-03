@@ -249,6 +249,7 @@ def _inject_slide_audio(label_files, hidden_files, cache_root, args):
         return
     logger.info(f"注入 audio_memory 到 {len(slide_files)} 个 slide 文件...")
     updated = 0
+    nan_count = 0
     for sf in slide_files:
         song_id = sf.stem.rsplit("_", 1)[0]
         if song_id not in hidden_files:
@@ -256,12 +257,18 @@ def _inject_slide_audio(label_files, hidden_files, cache_root, args):
         try:
             slide_data = torch.load(sf, map_location="cpu", weights_only=True)
             hidden = torch.load(hidden_files[song_id], map_location="cpu", weights_only=True)
-            slide_data["audio_memory"] = hidden["audio_memory"]
+            audio_memory = hidden["audio_memory"]
+            # ── NaN 检测 ──
+            if torch.is_tensor(audio_memory) and torch.isnan(audio_memory).any():
+                logger.warning(f"  ⚠ slide {sf.name}: audio_memory 含 NaN，用零替代")
+                audio_memory = torch.nan_to_num(audio_memory, nan=0.0)
+                nan_count += 1
+            slide_data["audio_memory"] = audio_memory
             _safe_save(slide_data, sf)
             updated += 1
         except Exception as e:
             logger.warning(f"  ✗ slide {sf.name}: {e}")
-    logger.info(f"已更新 {updated} 个 slide 文件")
+    logger.info(f"已更新 {updated} 个 slide 文件" + (f"（其中 {nan_count} 个含 NaN）" if nan_count else ""))
 
 
 def _strip_slide_audio(cache_root: Path) -> None:

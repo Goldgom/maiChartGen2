@@ -51,6 +51,11 @@ class SlidePathGenerator(nn.Module):
     def forward(self, target_path, start_pos, end_pos, duration, audio_memory):
         B, T_path = target_path.shape
         audio_memory = self.audio_proj(audio_memory)  # [B, T_audio, stage1_dim] → [B, T_audio, hidden_dim]
+
+        # ── 输入 NaN 检查（防止上游数据污染）──
+        if torch.isnan(audio_memory).any():
+            audio_memory = torch.nan_to_num(audio_memory, nan=0.0)
+
         start_pos = self._normalize_index(start_pos).to(target_path.device)
         end_pos = self._normalize_index(end_pos).to(target_path.device)
         duration = self._normalize_duration(duration).to(target_path.device)
@@ -58,24 +63,34 @@ class SlidePathGenerator(nn.Module):
         if cond.dim() == 2:
             cond = cond.unsqueeze(1)
         ctx = torch.cat([cond, audio_memory], dim=1)
+
         inp = target_path[:, :-1]
         tgt = target_path[:, 1:]
         T_in = inp.size(1)
         pos = torch.arange(T_in, device=target_path.device).unsqueeze(0).expand(B, -1)
         x = self.tok_embed(inp) + self.pos_embed(pos)
+
+        # mask dtype 跟随模型精度，不再写死 float16
+        model_dtype = next(self.parameters()).dtype
         mask = torch.triu(
-            torch.full((T_in, T_in), float("-inf"), device=target_path.device, dtype=torch.float16),
+            torch.full((T_in, T_in), float("-inf"), device=target_path.device, dtype=model_dtype),
             diagonal=1,
         )
         for layer in self.layers:
             x = layer(x, ctx, mask)
+
         logits = self.head(x)
+
+        # ── logits clamp：防止 cross_entropy 因极端值产生 inf ──
+        logits = torch.clamp(logits, min=-50.0, max=50.0)
+
         loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), tgt.reshape(-1), ignore_index=PAD)
         return {"logits": logits, "loss": loss}
 
     @torch.no_grad()
     def generate(self, audio_memory, start_pos, end_pos, duration, max_steps=8, temperature=0.8, top_k=10):
         device = next(self.parameters()).device
+        model_dtype = next(self.parameters()).dtype
         audio_memory = self.audio_proj(audio_memory.to(device))
         if isinstance(start_pos, int):
             start_pos = torch.tensor([start_pos], device=device)
@@ -99,7 +114,7 @@ class SlidePathGenerator(nn.Module):
                 pos = torch.arange(tokens.size(1), device=device).unsqueeze(0)
                 x = self.tok_embed(tokens) + self.pos_embed(pos)
             mask = None if tokens.numel() == 0 else torch.triu(
-                torch.full((tokens.size(1), tokens.size(1)), float("-inf"), device=device, dtype=torch.float16),
+                torch.full((tokens.size(1), tokens.size(1)), float("-inf"), device=device, dtype=model_dtype),
                 diagonal=1,
             )
             for layer in self.layers:
@@ -108,7 +123,11 @@ class SlidePathGenerator(nn.Module):
             if top_k > 0:
                 v, _ = torch.topk(logits, top_k)
                 logits[logits < v[:, -1:]] = float("-inf")
-            next_tok = torch.multinomial(torch.softmax(logits, dim=-1), 1).item()
+            probs = torch.softmax(logits, dim=-1)
+            # ── NaN 保护 ──
+            if torch.isnan(probs).any():
+                probs = torch.ones_like(probs) / probs.size(-1)
+            next_tok = torch.multinomial(probs, 1).item()
             generated.append(next_tok)
             if len(generated) % 2 == 0 and next_tok == int(end_pos.item()):
                 break

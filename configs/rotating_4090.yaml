@@ -29,33 +29,33 @@ train:
   batch_size: 1
   max_turns: 100000
   log_every: 10
-  eval_every_turns: 20
-  save_every_turns: 100
+  eval_every_turns: 0        # 0=仅在 epoch 完成时验证；>0=额外每 N turns 验证
+  save_every_turns: 0        # 0=仅在 epoch 完成时保存；>0=额外每 N turns 保存
   clip_grad_norm: 0.8
   offload_to_cpu: false
   grad_accum_steps: 1
   turn_batches: 8
-  cycle_turns: 2000
+  epochs_per_cycle: 1        # 循环训练中每阶段每轮训练几个 epoch
   stages:
     stage1:
       turn_batches: 8
-      cycle_turns: 2000
+      epochs_per_cycle: 1
       grad_accum_steps: 1
     touch:
       turn_batches: 16
-      cycle_turns: 1000
+      epochs_per_cycle: 1
       grad_accum_steps: 1
     slide:
       turn_batches: 32
-      cycle_turns: 1500
+      epochs_per_cycle: 1
       grad_accum_steps: 1
     break:
       turn_batches: 32
-      cycle_turns: 1500
+      epochs_per_cycle: 1
       grad_accum_steps: 1
     spike:
       turn_batches: 32
-      cycle_turns: 1500
+      epochs_per_cycle: 1
       grad_accum_steps: 1
 
 optim:
@@ -85,7 +85,7 @@ sched:
     touch:
       warmup_steps: 0
     slide:
-      warmup_steps: 0
+      warmup_steps: 200      # bf16 + cross-attn 需要 warmup 稳定
     break:
       warmup_steps: 0
     spike:
@@ -94,8 +94,15 @@ sched:
 checkpoint:
   dir: /data/maiG_v2/runs/rotating_4090
   keep_last: 5
-  best_metric: loss
+  best_metric: val_loss      # 用验证集 loss 判断最佳模型
   best_mode: min
+
+# ── Train / Val 划分 ──
+val:
+  max_val_level: 14.0        # 验证集最高难度（< 此值的歌曲进入 val 候选池）
+  val_ratio: 0.10            # 从低难度歌曲中抽多少比例做验证集（10%）
+  seed: 42                   # 划分随机种子
+  # split_file: splits/train_val_split.json  # 可选：从预生成的 JSON 读取划分
 
 models:
   stage1:
