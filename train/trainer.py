@@ -1,0 +1,500 @@
+from __future__ import annotations
+
+import os
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
+import csv
+import threading
+import time
+from dataclasses import dataclass, field
+from datetime import datetime
+from itertools import cycle
+from pathlib import Path
+from typing import Any, Callable
+
+import torch
+
+from .checkpoint import load_checkpoint, pack_config, save_checkpoint, _move_optimizer_state
+
+try:
+    from tqdm import tqdm
+except Exception:  # pragma: no cover
+    tqdm = None
+
+
+def _print_oom_batch(batch: dict[str, Any], stage_name: str, prev_batch: dict[str, Any] | None = None) -> None:
+    """打印 OOM 时的数据集详细信息，帮助定位问题歌曲。"""
+
+    def _describe(b: dict[str, Any] | None, label: str) -> str:
+        if b is None:
+            return f"  {label}: None"
+        f = b.get("_file", "?")
+        tok = b.get("tokens", b.get("config_tokens", b.get("target_path")))
+        tl = tok.size(-1) if tok is not None and tok.dim() >= 1 else 0  # 最后一个维度是序列长度
+        onset = b.get("onset")
+        ol = onset.size(-1) if onset is not None and onset.dim() >= 1 else 0
+        atok = b.get("audio_tokens")
+        al = atok.size(-1) if atok is not None and atok.dim() >= 1 else 0
+        return f"  {label}: {f}  tok={tl}  onset={ol}  enc_tok={al}"
+
+    if torch.cuda.is_available():
+        alloc = torch.cuda.memory_allocated() / 1024**3
+        reserved = torch.cuda.memory_reserved() / 1024**3
+        total = torch.cuda.get_device_properties(0).total_memory / 1024**3
+        mem_line = f"  GPU: {alloc:.2f}/{total:.2f} GiB allocated, {reserved:.2f} GiB reserved"
+        summary = torch.cuda.memory_summary()
+    else:
+        mem_line = "  GPU: N/A"
+        summary = ""
+
+    lines = [
+        "=" * 60,
+        f"  💥 OOM in stage '{stage_name}'",
+        _describe(batch, "当前 batch"),
+        _describe(prev_batch, "前一 batch (疑凶)"),
+        mem_line,
+        "=" * 60,
+    ]
+    if summary:
+        lines.append(summary)
+    print("\n".join(lines), flush=True)
+
+
+@dataclass
+class StageRuntime:
+    name: str
+    model: torch.nn.Module
+    optimizer: torch.optim.Optimizer
+    scheduler: Any
+    train_loader: Any
+    val_loader: Any | None
+    step_fn: Callable[[torch.nn.Module, dict[str, Any], torch.device], tuple[torch.Tensor, dict[str, float]]]
+    val_fn: Callable[[torch.nn.Module, dict[str, Any], torch.device], dict[str, float]] | None = None
+    turn_batches: int = 1
+    grad_accum_steps: int = 1
+    offload_to_cpu: bool = False
+    iterator: Any = field(default=None, init=False)
+    steps_done: int = field(default=0, init=False)
+    turns_done: int = field(default=0, init=False)
+
+
+class RotatingMultiStageTrainer:
+    def __init__(
+        self,
+        stages: list[StageRuntime],
+        device: str | torch.device = "cuda",
+        grad_clip_norm: float = 1.0,
+        precision: str = "amp",
+        log_every: int = 20,
+        eval_every_turns: int = 1,
+        save_every_turns: int = 1,
+        checkpoint_dir: str | Path = "runs/rotating",
+        keep_last: int = 3,
+        best_metric: str = "loss",
+        best_mode: str = "min",
+        resume_path: str | Path | None = None,
+        cfg: Any | None = None,
+    ):
+        self.stages = stages
+        self.device = torch.device(device if torch.cuda.is_available() or str(device) == "cpu" else "cpu")
+        self.grad_clip_norm = grad_clip_norm
+        self.precision = precision
+        self.log_every = log_every
+        self.eval_every_turns = eval_every_turns
+        self.save_every_turns = max(1, int(save_every_turns))
+        self.checkpoint_dir = Path(checkpoint_dir)
+        self.keep_last = keep_last
+        self.best_metric = best_metric
+        self.best_mode = best_mode
+        self.best_score = float("inf") if best_mode == "min" else float("-inf")
+        self.last_checkpoint: Path | None = None
+        self.best_checkpoint: Path | None = None
+        self.global_step = 0
+        self.global_turn = 0
+        self.cfg = cfg
+        self.scaler = torch.amp.GradScaler("cuda", enabled=(self.precision == "amp" and self.device.type == "cuda"))
+        self.resume_path = Path(resume_path) if resume_path else None
+        self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+        # 异步保存：允许新保存覆盖旧保存
+        self._save_thread: threading.Thread | None = None
+        self._cancel_save = threading.Event()
+
+        # 训练日志
+        self._log_path = self.checkpoint_dir / "training_log.csv"
+        self._log_file = open(self._log_path, "a", newline="")
+        self._log_writer = csv.writer(self._log_file)
+        if self._log_path.stat().st_size == 0:
+            self._log_writer.writerow(["timestamp", "turn", "step", "stage", "loss", "ppl", "metric", "save"])
+
+        # ── 性能 timing 日志 ──
+        self._time_path = self.checkpoint_dir / "timing_log.csv"
+        self._time_file = open(self._time_path, "a", newline="")
+        self._time_writer = csv.writer(self._time_file)
+        if self._time_path.stat().st_size == 0:
+            self._time_writer.writerow([
+                "timestamp", "stage", "turn", "batch",
+                "data_ms", "forward_ms", "backward_ms", "optim_ms",
+                "total_ms", "tokens", "seq_len", "loss",
+            ])
+
+        for stage in self.stages:
+            stage.iterator = cycle(stage.train_loader)
+            if not stage.offload_to_cpu:
+                stage.model.to(self.device)
+                _move_optimizer_state(stage.optimizer, self.device)
+
+        self._compile_models = cfg.get("compile", False) if cfg else False
+
+        # 打印混合精度配置
+        self._log_precision()
+
+    def _log_precision(self) -> None:
+        """打印混合精度训练配置。"""
+        amp_enabled = self.device.type == "cuda" and self.precision in {"amp", "bf16"}
+        scaler_on = self.scaler.is_enabled()
+        dtype_name = "bfloat16" if self.precision == "bf16" else ("float16" if self.precision == "amp" else "float32")
+        model_params = sum(p.numel() for stage in self.stages for p in stage.model.parameters())
+        print(f"  精度模式: {dtype_name}  |  autocast={'ON' if amp_enabled else 'OFF'}  |  "
+              f"GradScaler={'ON' if scaler_on else 'OFF'}  |  "
+              f"总参数: {model_params/1e6:.1f}M  |  "
+              f"grad_accum: {self.stages[0].grad_accum_steps if self.stages else 1}")
+
+    def _maybe_offload(self, stage: StageRuntime, to_device: bool) -> None:
+        if not stage.offload_to_cpu:
+            return
+        target = self.device if to_device else torch.device("cpu")
+        stage.model.to(target)
+        _move_optimizer_state(stage.optimizer, target)
+
+    def _train_turn(self, stage: StageRuntime) -> dict[str, float]:
+        self._maybe_offload(stage, True)
+        stage.model.train()
+        stats: dict[str, float] = {}
+        accum_steps = max(1, stage.grad_accum_steps)
+        stage.optimizer.zero_grad(set_to_none=True)
+        did_backward = False
+        did_scaled_backward = False
+        did_step = False
+        inner_pbar = None
+        if tqdm is not None and stage.turn_batches > 1:
+            inner_pbar = tqdm(total=stage.turn_batches, desc=f"{stage.name}", leave=False, dynamic_ncols=True)
+
+        t_turn_start = time.perf_counter()
+
+        for batch_idx in range(stage.turn_batches):
+            # ── 数据加载计时 ──
+            t_data_start = time.perf_counter()
+            batch = next(stage.iterator)
+            t_data = (time.perf_counter() - t_data_start) * 1000
+
+            # ── Forward 计时 ──
+            use_amp = self.device.type == "cuda" and self.precision in {"amp", "bf16"}
+            amp_dtype = torch.bfloat16 if self.precision == "bf16" else torch.float16
+
+            if self.device.type == "cuda":
+                torch.cuda.synchronize()
+            t_fwd_start = time.perf_counter()
+            try:
+                with torch.autocast(device_type=self.device.type, enabled=use_amp, dtype=amp_dtype):
+                    loss, step_stats = stage.step_fn(stage.model, batch, self.device)
+            except torch.OutOfMemoryError:
+                _print_oom_batch(batch, stage.name, getattr(self, "_last_batch", None))
+                raise
+            if self.device.type == "cuda":
+                torch.cuda.synchronize()
+            t_forward = (time.perf_counter() - t_fwd_start) * 1000
+
+            if not torch.isfinite(loss):
+                stats["nan_loss"] = float(loss.detach().item()) if torch.is_tensor(loss) else float("nan")
+                continue
+
+            loss = loss / max(1, stage.turn_batches * accum_steps)
+
+            # ── Backward 计时 ──
+            if self.device.type == "cuda":
+                torch.cuda.synchronize()
+            t_bwd_start = time.perf_counter()
+            if self.scaler.is_enabled():
+                self.scaler.scale(loss).backward()
+                did_scaled_backward = True
+            else:
+                loss.backward()
+            if self.device.type == "cuda":
+                torch.cuda.synchronize()
+            t_backward = (time.perf_counter() - t_bwd_start) * 1000
+
+            did_backward = True
+            stats.update(step_stats)
+            self.global_step += 1
+
+            # ── Optimizer step 计时 ──
+            t_optim = 0.0
+            if self.global_step % accum_steps == 0:
+                if self.device.type == "cuda":
+                    torch.cuda.synchronize()
+                t_opt_start = time.perf_counter()
+                did_step = self._step_if_ready(stage, did_scaled_backward)
+                if self.device.type == "cuda":
+                    torch.cuda.synchronize()
+                t_optim = (time.perf_counter() - t_opt_start) * 1000
+                did_backward = False
+                did_scaled_backward = False
+                # 每次 optimizer step 后释放 CUDA 缓存，避免 turn 内碎片化 OOM
+                if self.device.type == "cuda":
+                    torch.cuda.empty_cache()
+
+            # ── 记录 timing ──
+            tokens = batch.get("tokens")
+            seq_len = tokens.size(-1) if tokens is not None and tokens.dim() >= 1 else 0
+            self._time_writer.writerow([
+                datetime.now().isoformat(), stage.name, self.global_turn, batch_idx,
+                f"{t_data:.1f}", f"{t_forward:.1f}", f"{t_backward:.1f}", f"{t_optim:.1f}",
+                f"{t_data + t_forward + t_backward + t_optim:.1f}",
+                tokens.numel() if tokens is not None else 0, seq_len,
+                f"{float(loss.detach().item()):.6f}",
+            ])
+
+            if inner_pbar is not None:
+                inner_pbar.update(1)
+                inner_pbar.set_postfix(loss=f"{float(loss.detach().item()):.4f}")
+
+            # 记录当前 batch 作为"上一批"，OOM 时定位疑凶
+            self._last_batch = batch
+
+        # 末尾未 step 的梯度
+        if did_backward:
+            did_step = self._step_if_ready(stage, did_scaled_backward)
+            if self.device.type == "cuda":
+                torch.cuda.empty_cache()
+        if inner_pbar is not None:
+            inner_pbar.close()
+
+        if stage.scheduler is not None and did_step:
+            stage.scheduler.step()
+        stage.steps_done += stage.turn_batches
+        stage.turns_done += 1
+        self.global_turn += 1
+        self._maybe_offload(stage, False)
+
+        # 每 turn flush + 定期清理 CUDA 缓存
+        self._time_file.flush()
+        if self.device.type == "cuda" and self.global_turn % 10 == 0:
+            torch.cuda.empty_cache()
+
+        return stats
+
+    def _step_if_ready(self, stage: StageRuntime, did_scaled_backward: bool) -> bool:
+        has_grad = any(p.grad is not None for p in stage.model.parameters())
+        if not has_grad:
+            stage.optimizer.zero_grad(set_to_none=True)
+            return False
+        if self.grad_clip_norm is not None and self.scaler.is_enabled() and did_scaled_backward:
+            self.scaler.unscale_(stage.optimizer)
+        if self.grad_clip_norm is not None:
+            torch.nn.utils.clip_grad_norm_(stage.model.parameters(), self.grad_clip_norm)
+        if self.scaler.is_enabled():
+            self.scaler.step(stage.optimizer)
+            self.scaler.update()
+        else:
+            stage.optimizer.step()
+        stage.optimizer.zero_grad(set_to_none=True)
+        return True
+
+    def _should_improve(self, value: float) -> bool:
+        if self.best_mode == "min":
+            return value < self.best_score
+        return value > self.best_score
+
+    def _update_best(self, value: float) -> bool:
+        if self._should_improve(value):
+            self.best_score = value
+            self._pending_best = True  # 延迟到 save 周期
+            return True
+        return False
+
+    def _checkpoint_name(self, stage: StageRuntime, kind: str) -> str:
+        if len(self.stages) == 1:
+            return f"{stage.name}/{kind}.pt"
+        return f"{kind}.pt"
+
+    @torch.no_grad()
+    def _validate(self, stage: StageRuntime) -> dict[str, float]:
+        if stage.val_loader is None or stage.val_fn is None:
+            return {}
+        self._maybe_offload(stage, True)
+        stage.model.eval()
+        metrics: dict[str, float] = {}
+        count = 0
+        for batch in stage.val_loader:
+            batch_metrics = stage.val_fn(stage.model, batch, self.device)
+            for k, v in batch_metrics.items():
+                metrics[k] = metrics.get(k, 0.0) + float(v)
+            count += 1
+        if count:
+            metrics = {k: v / count for k, v in metrics.items()}
+        self._maybe_offload(stage, False)
+        return metrics
+
+    def save(self, name: str = "last.pt") -> Path:
+        """异步保存 checkpoint。
+
+        如果上一次保存还在进行中，取消它并启动新的保存（覆盖）。
+        所有 tensor 先拷贝到 CPU 再保存，避免阻塞 GPU 训练。
+        """
+        # 取消正在进行的保存
+        if self._save_thread is not None and self._save_thread.is_alive():
+            self._cancel_save.set()
+            self._save_thread.join(timeout=5.0)
+
+        self._cancel_save.clear()
+        path = self.checkpoint_dir / name
+
+        # 构建 payload —— 全部搬到 CPU
+        payload: dict[str, Any] = {
+            "global_step": self.global_step,
+            "global_turn": self.global_turn,
+            "cfg": pack_config(self.cfg),
+            "stages": [],
+        }
+        for stage in self.stages:
+            sd = stage.model.state_dict()
+            sd = {k.replace("_orig_mod.", ""): v for k, v in sd.items()}
+            # 模型权重 → CPU
+            sd_cpu = {k: v.detach().cpu() for k, v in sd.items()}
+
+            # 优化器状态 → CPU
+            raw_opt = stage.optimizer.state_dict()
+            opt_cpu: dict[str, Any] = {}
+            for ok, ov in raw_opt.items():
+                if ok == "state":
+                    opt_cpu[ok] = {
+                        idx: {
+                            sk: sv.detach().cpu() if torch.is_tensor(sv) else sv
+                            for sk, sv in s.items()
+                        }
+                        for idx, s in ov.items()
+                    }
+                elif ok == "param_groups":
+                    opt_cpu[ok] = [
+                        {
+                            pk: pv.detach().cpu() if torch.is_tensor(pv) else pv
+                            for pk, pv in pg.items()
+                        }
+                        for pg in ov
+                    ]
+                else:
+                    opt_cpu[ok] = ov
+
+            payload["stages"].append({
+                "name": stage.name,
+                "model": sd_cpu,
+                "optimizer": opt_cpu,
+                "scheduler": stage.scheduler.state_dict() if stage.scheduler is not None else None,
+                "steps_done": stage.steps_done,
+                "turns_done": stage.turns_done,
+            })
+
+        def _save_worker() -> None:
+            if not self._cancel_save.is_set():
+                save_checkpoint(path, payload)
+
+        self._save_thread = threading.Thread(target=_save_worker, daemon=True)
+        self._save_thread.start()
+        return path
+
+    def load(self, path: str | Path, restore_progress: bool = True) -> None:
+        payload = load_checkpoint(path, map_location="cpu")
+        if restore_progress:
+            self.global_step = int(payload.get("global_step", 0))
+            self.global_turn = int(payload.get("global_turn", 0))
+        stage_payloads = {s["name"]: s for s in payload.get("stages", [])}
+        for stage in self.stages:
+            if stage.name not in stage_payloads:
+                continue
+            sp = stage_payloads[stage.name]
+            stage.model.load_state_dict(sp["model"], strict=False)
+            stage.optimizer.load_state_dict(sp["optimizer"])
+            if stage.scheduler is not None and sp.get("scheduler") is not None:
+                stage.scheduler.load_state_dict(sp["scheduler"])
+            if restore_progress:
+                stage.steps_done = int(sp.get("steps_done", 0))
+                stage.turns_done = int(sp.get("turns_done", 0))
+
+    def fit(self, max_turns: int | None = None, max_steps: int | None = None) -> None:
+        # torch.compile 必须在 load 之后调用
+        if getattr(self, "_compile_models", False):
+            import logging
+            logging.info("启用 torch.compile ...")
+            for stage in self.stages:
+                try:
+                    stage.model = torch.compile(stage.model, dynamic=True)
+                except Exception:
+                    pass
+
+        stage_cycle = cycle(self.stages)
+        pbar = None
+        if tqdm is not None and max_turns is not None:
+            pbar = tqdm(total=max_turns, initial=self.global_turn, desc="turns", dynamic_ncols=True)
+        while True:
+            if max_turns is not None and self.global_turn >= max_turns:
+                break
+            if max_steps is not None and self.global_step >= max_steps:
+                break
+            stage = next(stage_cycle)
+            stats = self._train_turn(stage)
+            metric_value = stats.get(self.best_metric)
+            best_updated = False
+            if metric_value is not None and torch.isfinite(torch.tensor(metric_value)):
+                best_updated = self._update_best(float(metric_value))
+            if pbar is not None:
+                pbar.update(1)
+                loss_value = float(stats.get("loss", float("nan")))
+                postfix = {
+                    "stage": stage.name,
+                    "loss": f"{loss_value:.4f}",
+                    "ppl": f"{torch.exp(torch.tensor(loss_value)).item():.2f}" if torch.isfinite(torch.tensor(loss_value)) else "nan",
+                    "turn": f"{self.global_turn}/{max_turns}" if max_turns is not None else str(self.global_turn),
+                }
+                if self.last_checkpoint is not None:
+                    postfix["last"] = self.last_checkpoint.name
+                if self.best_checkpoint is not None:
+                    postfix["best"] = self.best_checkpoint.name
+                pbar.set_postfix(postfix)
+            if self.global_turn % self.log_every == 0:
+                msg = ", ".join(f"{k}={v:.4f}" for k, v in stats.items())
+                save_state = "best" if best_updated else "last"
+                print(f"[turn {self.global_turn} | step {self.global_step} | {save_state}] {stage.name}: {msg}")
+                # 写入 CSV 日志
+                loss_val = float(stats.get("loss", float("nan")))
+                ppl_val = torch.exp(torch.tensor(loss_val)).item() if torch.isfinite(torch.tensor(loss_val)) else float("nan")
+                self._log_writer.writerow([
+                    datetime.now().isoformat(), self.global_turn, self.global_step,
+                    stage.name, f"{loss_val:.6f}", f"{ppl_val:.4f}",
+                    f"{metric_value:.6f}" if metric_value is not None else "",
+                    save_state,
+                ])
+                self._log_file.flush()
+            if self.eval_every_turns and self.global_turn % self.eval_every_turns == 0:
+                val = self._validate(stage)
+                if val:
+                    msg = ", ".join(f"{k}={v:.4f}" for k, v in val.items())
+                    print(f"[val  {self.global_turn} | step {self.global_step}] {stage.name}: {msg}")
+            if self.global_turn % self.save_every_turns == 0 or self.global_turn == max_turns:
+                if getattr(self, "_pending_best", False):
+                    self.best_checkpoint = self.save(self._checkpoint_name(stage, "best"))
+                    self._pending_best = False
+                self.last_checkpoint = self.save(self._checkpoint_name(stage, "last"))
+        if pbar is not None:
+            pbar.close()
+        # 等待所有异步保存完成，避免进程退出时 daemon 线程被杀死导致文件损坏
+        self._wait_saves()
+
+    def _wait_saves(self) -> None:
+        """等待所有异步保存线程完成。"""
+        if self._save_thread is not None and self._save_thread.is_alive():
+            self._save_thread.join(timeout=30.0)
+            if self._save_thread.is_alive():
+                # 超时也取消，至少保证文件不会被写一半
+                self._cancel_save.set()
+                self._save_thread.join(timeout=5.0)

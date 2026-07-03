@@ -1,0 +1,42 @@
+# Conda/Python
+.conda
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# Data & Models (too large for git)
+datasets/
+checkpoints/
+.train_cache/
+*.pt
+*.pth
+*.bin
+*.safetensors
+*.pkl
+
+# Cache & Runs
+cache/
+runs/
+*.log
+logs/
+
+# Media
+*.mp3
+*.wav
+*.mp4
+
+# IDE
+.vscode/
+.idea/
+
+# Test outputs
+test/
+tests/
+
+# Misc
+web_outputs/
+*.swp
+.DS_Store
