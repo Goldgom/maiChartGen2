@@ -126,7 +126,7 @@ def main() -> None:
 
     checkpoint = str(stage_checkpoint(args.checkpoint_dir, "stage1", "best"))
     if not run(
-        [PYTHON, "scripts/build_stage234_cache.py", "--step", "all", "--checkpoint", checkpoint, "--config", args.config, "--cache-root", args.cache_root],
+        [PYTHON, "scripts/build_stage234_cache.py", "--step", "all", "--checkpoint", checkpoint, "--config", args.config, "--cache-root", args.cache_root, "--num-workers", str(args.num_workers)],
         "Phase 3: export hidden + build downstream caches",
     ):
         sys.exit(1)

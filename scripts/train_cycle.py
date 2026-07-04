@@ -168,7 +168,7 @@ def main() -> None:
 
         ckpt = stage_checkpoint(args.checkpoint_dir, "stage1", "best")
         if not run(
-            [PYTHON, "scripts/build_stage234_cache.py", "--step", "all", "--checkpoint", str(ckpt), "--config", args.config, "--cache-root", args.cache_root],
+            [PYTHON, "scripts/build_stage234_cache.py", "--step", "all", "--checkpoint", str(ckpt), "--config", args.config, "--cache-root", args.cache_root, "--num-workers", str(args.num_workers)],
             f"[Cycle {cycle}] Export hidden + rebuild downstream caches",
         ):
             sys.exit(1)

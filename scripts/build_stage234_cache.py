@@ -22,10 +22,12 @@ Step 2 — 构建 Touch/Break/Spike 缓存:
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import logging
 import os
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -177,94 +179,97 @@ def build_stage_cache(
     cache_root: Path,
     name: str,
 ) -> int:
-    """构建 touch/break/spike 缓存。返回成功数量。"""
+    """Build per-song downstream caches and save them as one grouped batch."""
     if not labels_path.exists():
-        logger.warning(f"  ⚠ 缺少 labels: {labels_path}")
+        logger.warning(f"  missing labels: {labels_path}")
         return 0
     if not hidden_path.exists():
-        logger.warning(f"  ⚠ 缺少 hidden: {hidden_path}")
+        logger.warning(f"  missing hidden: {hidden_path}")
         return 0
 
+    outputs = _prepare_stage_cache_outputs(labels_path, hidden_path, cache_root, name)
+    _save_many(outputs)
+    return len(outputs)
+
+
+def _prepare_stage_cache_outputs(
+    labels_path: Path,
+    hidden_path: Path,
+    cache_root: Path,
+    name: str,
+) -> list[tuple[Path, dict[str, Any]]]:
     labels = torch.load(labels_path, map_location="cpu", weights_only=True)
     hidden = torch.load(hidden_path, map_location="cpu", weights_only=True)
 
     stage1_hidden = hidden["stage1_hidden"]
     audio_memory = hidden["audio_memory"]
-
-    # Align lengths: stage1_hidden [T_tok, D], labels [T_tok, ...]
     T_hidden = stage1_hidden.size(0)
     T_labels = labels["stage1_tokens"].size(0)
     T = min(T_hidden, T_labels)
 
-    ok = 0
+    token_slice = labels["stage1_tokens"][:T]
+    hidden_slice = stage1_hidden[:T]
+    outputs: list[tuple[Path, dict[str, Any]]] = []
 
-    # ── Touch cache ──
-    touch_dir = cache_root / "touch"
-    touch_dir.mkdir(parents=True, exist_ok=True)
-    torch.save({
-        "config_tokens": labels["stage1_tokens"][:T],
-        "stage1_hidden": stage1_hidden[:T],
-        "audio_memory": audio_memory,
-        "zone_targets": labels["touch_targets"][:T],
-    }, touch_dir / f"{name}.pt")
-    ok += 1
+    outputs.append((
+        cache_root / "touch" / f"{name}.pt",
+        {
+            "config_tokens": token_slice,
+            "stage1_hidden": hidden_slice,
+            "audio_memory": audio_memory,
+            "zone_targets": labels["touch_targets"][:T],
+        },
+    ))
+    outputs.append((
+        cache_root / "break" / f"{name}.pt",
+        {
+            "tokens": token_slice,
+            "stage1_hidden": hidden_slice,
+            "targets": labels["break_targets"][:T],
+            "press_mask": labels["press_mask"][:T],
+        },
+    ))
+    outputs.append((
+        cache_root / "spike" / f"{name}.pt",
+        {
+            "tokens": token_slice,
+            "stage1_hidden": hidden_slice,
+            "targets": labels["spike_targets"][:T],
+            "touch_mask": labels["touch_mask"][:T],
+        },
+    ))
 
-    # ── Break cache ──
-    break_dir = cache_root / "break"
-    break_dir.mkdir(parents=True, exist_ok=True)
-    torch.save({
-        "tokens": labels["stage1_tokens"][:T],
-        "stage1_hidden": stage1_hidden[:T],
-        "targets": labels["break_targets"][:T],
-        "press_mask": labels["press_mask"][:T],
-    }, break_dir / f"{name}.pt")
-    ok += 1
-
-    # ── Spike cache ──
-    spike_dir = cache_root / "spike"
-    spike_dir.mkdir(parents=True, exist_ok=True)
-    torch.save({
-        "tokens": labels["stage1_tokens"][:T],
-        "stage1_hidden": stage1_hidden[:T],
-        "targets": labels["spike_targets"][:T],
-        "touch_mask": labels["touch_mask"][:T],
-    }, spike_dir / f"{name}.pt")
-    ok += 1
-
-    # ── Hold cache (Stage 3) ──
-    hold_dir = cache_root / "hold"
-    hold_dir.mkdir(parents=True, exist_ok=True)
     hold_mask = torch.zeros(T, dtype=torch.bool)
     dur_num_targets = torch.zeros(T, dtype=torch.long)
     dur_den_targets = torch.zeros(T, dtype=torch.long)
     _compute_hold_targets_from_labels(labels, T, hold_mask, dur_num_targets, dur_den_targets)
-    torch.save({
-        "tokens": labels["stage1_tokens"][:T],
-        "stage1_hidden": stage1_hidden[:T],
-        "hold_mask": hold_mask,
-        "dur_num_targets": dur_num_targets,
-        "dur_den_targets": dur_den_targets,
-    }, hold_dir / f"{name}.pt")
-    ok += 1
+    outputs.append((
+        cache_root / "hold" / f"{name}.pt",
+        {
+            "tokens": token_slice,
+            "stage1_hidden": hidden_slice,
+            "hold_mask": hold_mask,
+            "dur_num_targets": dur_num_targets,
+            "dur_den_targets": dur_den_targets,
+        },
+    ))
 
-    # ── Touch Hold cache (Stage 4) ──
-    thold_dir = cache_root / "touch_hold"
-    thold_dir.mkdir(parents=True, exist_ok=True)
     thold_mask = torch.zeros(T, dtype=torch.bool)
     thold_num = torch.zeros(T, dtype=torch.long)
     thold_den = torch.zeros(T, dtype=torch.long)
     _compute_touch_hold_targets_from_labels(labels, T, thold_mask, thold_num, thold_den)
-    torch.save({
-        "tokens": labels["stage1_tokens"][:T],
-        "stage1_hidden": stage1_hidden[:T],
-        "touch_hold_mask": thold_mask,
-        "dur_num_targets": thold_num,
-        "dur_den_targets": thold_den,
-    }, thold_dir / f"{name}.pt")
-    ok += 1
+    outputs.append((
+        cache_root / "touch_hold" / f"{name}.pt",
+        {
+            "tokens": token_slice,
+            "stage1_hidden": hidden_slice,
+            "touch_hold_mask": thold_mask,
+            "dur_num_targets": thold_num,
+            "dur_den_targets": thold_den,
+        },
+    ))
 
-    return ok
-
+    return outputs
 
 def _compute_hold_targets_from_labels(labels, T, hold_mask, num_t, den_t):
     """从 labels 计算 hold duration 训练目标。"""
@@ -335,6 +340,13 @@ def _safe_save(data: Any, path: Path) -> None:
     tmp = path.with_suffix(path.suffix + ".tmp")
     torch.save(data, tmp)
     tmp.replace(path)
+
+
+def _save_many(outputs: list[tuple[Path, dict[str, Any]]]) -> None:
+    """Save a per-song batch of small cache files in one tight write loop."""
+    for path, data in outputs:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _safe_save(data, path)
 
 
 def _inject_slide_audio(label_files, hidden_files, cache_root, args):
@@ -568,6 +580,9 @@ def run_build_caches(args):
         return
 
     hidden_files = {f.stem: f for f in hidden_dir.glob("*.pt")}
+    for stage_dir in ("touch", "break", "spike", "hold", "touch_hold"):
+        (cache_root / stage_dir).mkdir(parents=True, exist_ok=True)
+
 
     if args.strip_slide_audio:
         _strip_slide_audio(cache_root)
@@ -584,13 +599,60 @@ def run_build_caches(args):
     logger.info(f"可构建缓存: {len(common)} 首 (labels∩hidden)")
 
     ok = fail = 0
-    for name in common:
-        try:
-            n = build_stage_cache(label_files[name], hidden_files[name], cache_root, name)
-            ok += n
-        except Exception as e:
-            logger.warning(f"  ✗ {name}: {e}")
-            fail += 1
+    t0 = time.time()
+    total = len(common)
+    worker_count = max(1, int(getattr(args, "num_workers", 1)))
+    if worker_count == 1:
+        for i, name in enumerate(common, 1):
+            try:
+                n = build_stage_cache(label_files[name], hidden_files[name], cache_root, name)
+                ok += n
+            except Exception as e:
+                logger.warning(f"  error {name}: {e}")
+                fail += 1
+            if i % 50 == 0 or i == total:
+                elapsed = time.time() - t0
+                rate = i / elapsed if elapsed > 0 else 0.0
+                remaining = max(0, total - i)
+                eta_seconds = remaining / rate if rate > 0 else 0.0
+                logger.info(
+                    "  progress: %d/%d songs | cache_files=%d ok, fail=%d | %.2f songs/s | ETA %.1f min",
+                    i,
+                    total,
+                    ok,
+                    fail,
+                    rate,
+                    eta_seconds / 60.0,
+                )
+    else:
+        logger.info(f"parallel build enabled: num_workers={worker_count}")
+        futures = {}
+        with ThreadPoolExecutor(max_workers=worker_count) as ex:
+            for name in common:
+                futures[ex.submit(build_stage_cache, label_files[name], hidden_files[name], cache_root, name)] = name
+            done = 0
+            for fu in as_completed(futures):
+                done += 1
+                name = futures[fu]
+                try:
+                    ok += int(fu.result())
+                except Exception as e:
+                    logger.warning(f"  error {name}: {e}")
+                    fail += 1
+                if done % 50 == 0 or done == total:
+                    elapsed = time.time() - t0
+                    rate = done / elapsed if elapsed > 0 else 0.0
+                    remaining = max(0, total - done)
+                    eta_seconds = remaining / rate if rate > 0 else 0.0
+                    logger.info(
+                        "  progress: %d/%d songs | cache_files=%d ok, fail=%d | %.2f songs/s | ETA %.1f min",
+                        done,
+                        total,
+                        ok,
+                        fail,
+                        rate,
+                        eta_seconds / 60.0,
+                    )
 
     logger.info(f"完成! 生成 {ok} 个缓存文件, 失败 {fail}")
 
@@ -606,6 +668,7 @@ def main():
     p.add_argument("--config", default="configs/rotating_4090.yaml")
     p.add_argument("--cache-root", default="/data/maiG_v2/cache")
     p.add_argument("--limit", type=int, default=None)
+    p.add_argument("--num-workers", type=int, default=1, help="Parallel workers for cache building")
     p.add_argument("--cpu", action="store_true")
     p.add_argument("--skip-existing", action="store_true")
     p.add_argument("--placeholder", action="store_true", help="无 Stage 1 模型时，用零值 hidden 占位生成缓存")

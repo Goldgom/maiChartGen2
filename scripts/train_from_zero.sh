@@ -71,6 +71,7 @@ echo "[3/7] Export stage1 hidden + build downstream caches"
   --checkpoint "$STAGE1_CKPT" \
   --config "$CONFIG" \
   --cache-root "$CACHE_ROOT" \
+  --num-workers "$NUM_WORKERS" \
   "${LIMIT_ARGS[@]}"
 
 echo "[4/7] Build event-stage caches"

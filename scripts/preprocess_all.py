@@ -65,6 +65,8 @@ def run_step(script: str, description: str, args: argparse.Namespace) -> bool:
     if "build_stage234" in script:
         cmd.extend(["--step", "build-caches", "--placeholder", "--cache-root", str(args.cache_root)])
         cmd.extend(["--config", "configs/rotating_4090.yaml"])
+        if args.num_workers:
+            cmd.extend(["--num-workers", str(args.num_workers)])
         if args.limit:
             cmd.extend(["--limit", str(args.limit)])
 
