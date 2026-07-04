@@ -12,6 +12,7 @@ from models.hold_stage import HoldDurationPredictor, TouchHoldDurationPredictor
 from models.break_stage import BreakClassifier
 from models.spike_stage import SpikeClassifier
 from models.touch_pattern_stage import TouchPatternRefiner
+from Tokenizer.slide_star_vocab import SLD_STAR_VOCAB_SIZE
 
 
 def _ensure_batch_dim(x: torch.Tensor) -> torch.Tensor:
@@ -94,6 +95,7 @@ def slide_step(model: SlidePathGenerator, batch: dict[str, Any], device: torch.d
     onset = batch.get("onset")
     if onset is not None:
         onset = _as_batch(onset).to(device)
+    _validate_stage2_star_batch(model, batch, target_path, start_pos, audio_memory, stage1_hidden, onset)
 
     out = model(
         target_path, start_pos, audio_memory,
@@ -121,6 +123,62 @@ def spike_step(model: SpikeClassifier, batch: dict[str, Any], device: torch.devi
     logits = model(tokens, stage1_hidden)
     loss = model.compute_loss(logits, targets, touch_mask)
     return loss, {"loss": float(loss.detach().item())}
+
+
+def _stage2_star_files(batch: dict[str, Any]) -> str:
+    files = batch.get("_file")
+    if isinstance(files, (list, tuple)):
+        return ", ".join(str(x) for x in files[:4])
+    if files is None:
+        return "<unknown>"
+    return str(files)
+
+
+def _validate_stage2_star_batch(
+    model: SlidePathGenerator,
+    batch: dict[str, Any],
+    target_path: torch.Tensor,
+    start_pos: torch.Tensor,
+    audio_memory: torch.Tensor,
+    stage1_hidden: torch.Tensor | None,
+    onset: torch.Tensor | None,
+) -> None:
+    files = _stage2_star_files(batch)
+    if target_path.dtype != torch.long:
+        raise ValueError(f"stage2_star target_path dtype must be long, got {target_path.dtype} from {files}")
+    if start_pos.dtype != torch.long:
+        raise ValueError(f"stage2_star start_pos dtype must be long, got {start_pos.dtype} from {files}")
+    if target_path.dim() != 2:
+        raise ValueError(f"stage2_star target_path must be [B, T], got {tuple(target_path.shape)} from {files}")
+
+    target_min = int(target_path.min().item())
+    target_max = int(target_path.max().item())
+    if target_min < 0 or target_max >= SLD_STAR_VOCAB_SIZE:
+        raise ValueError(
+            f"stage2_star target_path out of range [{target_min}, {target_max}] "
+            f"for vocab_size={SLD_STAR_VOCAB_SIZE} from {files}"
+        )
+
+    start_flat = start_pos.reshape(-1)
+    start_min = int(start_flat.min().item())
+    start_max = int(start_flat.max().item())
+    if start_min < 1 or start_max > 8:
+        raise ValueError(f"stage2_star start_pos out of range [{start_min}, {start_max}] from {files}")
+
+    pos_capacity = getattr(getattr(model, "pos_embed", None), "num_embeddings", None)
+    if pos_capacity is not None and target_path.size(1) - 1 >= pos_capacity:
+        raise ValueError(
+            f"stage2_star target_path too long: len={target_path.size(1)} exceeds pos_embed capacity={pos_capacity} "
+            f"from {files}"
+        )
+
+    for name, tensor in (
+        ("audio_memory", audio_memory),
+        ("stage1_hidden", stage1_hidden),
+        ("onset", onset),
+    ):
+        if tensor is not None and not torch.isfinite(tensor).all():
+            raise ValueError(f"stage2_star {name} contains NaN/Inf from {files}")
 
 
 # ── Stage 3: Hold 持续时间预测 ──
