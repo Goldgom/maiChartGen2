@@ -4,7 +4,6 @@ import os
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import csv
-import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -23,7 +22,7 @@ except Exception:  # pragma: no cover
 
 
 def _print_oom_batch(batch: dict[str, Any], stage_name: str, prev_batch: dict[str, Any] | None = None) -> None:
-    """打印 OOM 时的数据集详细信息，帮助定位问题歌曲。"""
+    """打印 OOM 时的 batch 信息以辅助定位"""
 
     def _describe(b: dict[str, Any] | None, label: str) -> str:
         if b is None:
@@ -117,8 +116,6 @@ class RotatingMultiStageTrainer:
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
         # 异步保存：允许新保存覆盖旧保存
-        self._save_thread: threading.Thread | None = None
-        self._cancel_save = threading.Event()
 
         # 训练日志
         self._log_path = self.checkpoint_dir / "training_log.csv"
@@ -150,14 +147,14 @@ class RotatingMultiStageTrainer:
         self._log_precision()
 
     def _log_precision(self) -> None:
-        """打印混合精度训练配置。"""
+        """打印混合精度配置信息"""
         amp_enabled = self.device.type == "cuda" and self.precision in {"amp", "bf16"}
         scaler_on = self.scaler.is_enabled()
         dtype_name = "bfloat16" if self.precision == "bf16" else ("float16" if self.precision == "amp" else "float32")
         model_params = sum(p.numel() for stage in self.stages for p in stage.model.parameters())
         print(f"  精度模式: {dtype_name}  |  autocast={'ON' if amp_enabled else 'OFF'}  |  "
               f"GradScaler={'ON' if scaler_on else 'OFF'}  |  "
-              f"总参数: {model_params/1e6:.1f}M  |  "
+              f"总参数 {model_params/1e6:.1f}M  |  "
               f"grad_accum: {self.stages[0].grad_accum_steps if self.stages else 1}")
 
     def _maybe_offload(self, stage: StageRuntime, to_device: bool) -> None:
@@ -262,7 +259,7 @@ class RotatingMultiStageTrainer:
             # 记录当前 batch 作为"上一批"，OOM 时定位疑凶
             self._last_batch = batch
 
-        # 末尾未 step 的梯度
+        # 末尾未 step 的补刀
         if did_backward:
             did_step = self._step_if_ready(stage, did_scaled_backward)
             if self.device.type == "cuda":
@@ -337,20 +334,10 @@ class RotatingMultiStageTrainer:
         return metrics
 
     def save(self, name: str = "last.pt") -> Path:
-        """异步保存 checkpoint。
-
-        如果上一次保存还在进行中，取消它并启动新的保存（覆盖）。
-        所有 tensor 先拷贝到 CPU 再保存，避免阻塞 GPU 训练。
-        """
-        # 取消正在进行的保存
-        if self._save_thread is not None and self._save_thread.is_alive():
-            self._cancel_save.set()
-            self._save_thread.join(timeout=5.0)
-
-        self._cancel_save.clear()
+        """保存 checkpoint，返回保存路径"""
         path = self.checkpoint_dir / name
 
-        # 构建 payload —— 全部搬到 CPU
+        # 构建 payload：全部搬到 CPU，避免保存时持有 GPU tensor。
         payload: dict[str, Any] = {
             "global_step": self.global_step,
             "global_turn": self.global_turn,
@@ -360,10 +347,8 @@ class RotatingMultiStageTrainer:
         for stage in self.stages:
             sd = stage.model.state_dict()
             sd = {k.replace("_orig_mod.", ""): v for k, v in sd.items()}
-            # 模型权重 → CPU
             sd_cpu = {k: v.detach().cpu() for k, v in sd.items()}
 
-            # 优化器状态 → CPU
             raw_opt = stage.optimizer.state_dict()
             opt_cpu: dict[str, Any] = {}
             for ok, ov in raw_opt.items():
@@ -395,12 +380,7 @@ class RotatingMultiStageTrainer:
                 "turns_done": stage.turns_done,
             })
 
-        def _save_worker() -> None:
-            if not self._cancel_save.is_set():
-                save_checkpoint(path, payload)
-
-        self._save_thread = threading.Thread(target=_save_worker, daemon=True)
-        self._save_thread.start()
+        save_checkpoint(path, payload)
         return path
 
     def load(self, path: str | Path, restore_progress: bool = True) -> None:
@@ -558,12 +538,11 @@ class RotatingMultiStageTrainer:
         if pbar is not None:
             pbar.close()
         self._wait_saves()
+        self._log_file.flush()
+        self._time_file.flush()
+        self._log_file.close()
+        self._time_file.close()
 
     def _wait_saves(self) -> None:
-        """等待所有异步保存线程完成。"""
-        if self._save_thread is not None and self._save_thread.is_alive():
-            self._save_thread.join(timeout=30.0)
-            if self._save_thread.is_alive():
-                # 超时也取消，至少保证文件不会被写一半
-                self._cancel_save.set()
-                self._save_thread.join(timeout=5.0)
+        """等待异步保存完成"""
+        return

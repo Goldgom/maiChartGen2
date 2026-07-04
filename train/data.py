@@ -225,8 +225,8 @@ def _extract_song_id(filepath: Path, stage: str) -> str:
     """从缓存文件路径中提取原始 song_id（去掉 _lv{N} 后缀）。"""
     stem = filepath.stem
     # stage1: {song_id}_lv{N}
-    # touch/break/spike: {song_id}_lv{N}_{idx}
-    # slide: {song_id}_lv{N}_{idx:03d}
+    # touch/break/spike/hold/touch_hold: {song_id}_lv{N}_{idx}
+    # slide/stage2_star: {song_id}_lv{N}_{idx:03d}
     # 先去掉最后的 _{idx} / _{idx:03d}
     if stage != "stage1":
         stem = stem.rsplit("_", 1)[0]
@@ -235,10 +235,10 @@ def _extract_song_id(filepath: Path, stage: str) -> str:
 
 
 def _extract_chart_id(filepath: Path, stage: str) -> str:
-    """从缓存文件路径中提取完整 chart_id ({song_id}_lv{N})。"""
+    """从缓存文件路径中提取完整 chart_id。slide/stage2_star 返回 {song_id}_lv{N}，其余返回 {song_id}_lv{N}_{idx}。"""
     stem = filepath.stem
-    # slide: {song_id}_lv{N}_{idx:03d} → 去掉最后一个 _{idx}
-    # touch/break/spike/hold/touch_hold: {song_id}_lv{N} → 就是 chart_id
+    # slide/stage2_star: {song_id}_lv{N}_{idx:03d} → 去掉最后一个 _{idx}
+    # touch/break/spike/hold/touch_hold: {song_id}_lv{N}_{idx} → chart_id 包含 _idx
     if stage in ("slide", "stage2_star"):
         stem = stem.rsplit("_", 1)[0]
     return stem
