@@ -1130,12 +1130,14 @@ def main():
         logger.info("无需处理"); return
 
     ok = fail = 0
+    failed_items: list[dict[str, str]] = []
     if args.num_workers > 1:
         with ThreadPoolExecutor(max_workers=args.num_workers) as ex:
             fut = {ex.submit(process_one, f, audio_dir, args.max_tokens, args.maxsubdiv): f for f in folders}
             for fu in as_completed(fut):
                 r = fu.result()
                 if "error" in r:
+                    failed_items.append({"folder": fut[fu].name, "error": str(r["error"])})
                     logger.warning(f"  ✗ {fut[fu].name}: {r['error']}"); fail += 1
                 else:
                     save_all(r, cache_root); ok += 1
@@ -1146,11 +1148,17 @@ def main():
             logger.info(f"[{i+1}/{len(folders)}] {f.name}")
             r = process_one(f, audio_dir, args.max_tokens, args.maxsubdiv)
             if "error" in r:
+                failed_items.append({"folder": f.name, "error": str(r["error"])})
                 logger.warning(f"  ✗ {r['error']}"); fail += 1
             else:
                 save_all(r, cache_root); ok += 1
 
     logger.info(f"完成! 成功: {ok}, 失败: {fail}")
+
+    (cache_root / "preprocess_label_failures.json").write_text(
+        json.dumps(failed_items, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
 
 
 if __name__ == "__main__":

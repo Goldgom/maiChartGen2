@@ -6,12 +6,37 @@ CACHE_ROOT="${CACHE_ROOT:-/data/maiG_v2/cache}"
 CONFIG="${CONFIG:-configs/rotating_4090.yaml}"
 RUN_DIR="${RUN_DIR:-/data/maiG_v2/runs/rotating_4090}"
 PYTHON="${PYTHON:-python}"
+LOG_FILE="${LOG_FILE:-terminal.log}"
 NUM_WORKERS="${NUM_WORKERS:-6}"
 MAXSUBDIV="${MAXSUBDIV:-64}"
 MAX_TOKENS="${MAX_TOKENS:-16384}"
 ENCODEC_LAYERS="${ENCODEC_LAYERS:-1}"
+STAGE1_EPOCHS="${STAGE1_EPOCHS:-1}"
+REFINE_EPOCHS="${REFINE_EPOCHS:-1}"
 LIMIT_ARGS=()
 export DATA_ROOT CACHE_ROOT CONFIG RUN_DIR
+
+LOG_DIR="$(dirname "$LOG_FILE")"
+if [[ "$LOG_DIR" != "." ]]; then
+  mkdir -p "$LOG_DIR"
+fi
+exec > >(tee -a "$LOG_FILE") 2>&1
+trap 'status=$?; echo "train_from_zero finished: $(date -Is) exit_status=$status"' EXIT
+
+echo "============================================================"
+echo "train_from_zero started: $(date -Is)"
+echo "log_file=$LOG_FILE"
+echo "data_root=$DATA_ROOT"
+echo "cache_root=$CACHE_ROOT"
+echo "config=$CONFIG"
+echo "run_dir=$RUN_DIR"
+echo "python=$PYTHON"
+echo "num_workers=$NUM_WORKERS"
+echo "maxsubdiv=$MAXSUBDIV"
+echo "max_tokens=$MAX_TOKENS"
+echo "stage1_epochs=$STAGE1_EPOCHS"
+echo "refine_epochs=$REFINE_EPOCHS"
+echo "============================================================"
 
 if [[ "${1:-}" == "--smoke-limit" ]]; then
   LIMIT_ARGS=(--limit "${2:?missing limit value}")
@@ -32,7 +57,8 @@ echo "[1/7] Preprocess audio + labels"
 echo "[2/7] Train stage1"
 "$PYTHON" train.py \
   --config "$CONFIG" \
-  --train-stage stage1
+  --train-stage stage1 \
+  --max-epochs "$STAGE1_EPOCHS"
 
 STAGE1_CKPT="${STAGE1_CKPT:-$RUN_DIR/stage1/best.pt}"
 if [[ ! -f "$STAGE1_CKPT" ]]; then
@@ -66,7 +92,8 @@ for STAGE in stage2_star hold touch_hold stage5_touch stage6_break_note stage7_f
   echo "  -> $STAGE"
   "$PYTHON" train.py \
     --config "$CONFIG" \
-    --train-stage "$STAGE"
+    --train-stage "$STAGE" \
+    --max-epochs "$REFINE_EPOCHS"
 done
 
 echo "[6/7] Optional legacy stages"
@@ -75,7 +102,8 @@ if [[ "${TRAIN_LEGACY_STAGES:-0}" == "1" ]]; then
     echo "  -> $STAGE"
     "$PYTHON" train.py \
       --config "$CONFIG" \
-      --train-stage "$STAGE"
+      --train-stage "$STAGE" \
+      --max-epochs "$REFINE_EPOCHS"
   done
 fi
 

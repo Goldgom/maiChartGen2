@@ -45,4 +45,11 @@ class SpikeClassifier(nn.Module):
         return F.cross_entropy(flat_logits, flat_targets)
 
 
+    @torch.no_grad()
+    def predict_probabilities(self, tokens: torch.Tensor, stage1_hidden: torch.Tensor) -> torch.Tensor:
+        """Return P(firework/spike) for each [batch, token, touch-zone]."""
+        logits = self(tokens, stage1_hidden)
+        return torch.softmax(logits.float(), dim=-1)[..., 1]
+
+
 spikeG = SpikeClassifier

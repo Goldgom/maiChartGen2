@@ -1,20 +1,4 @@
-"""
-循环训练: 7 阶段流水线交替训练
-
-每轮循环 (以 epoch 为单位，1 epoch = 全量数据过一遍):
-  1. 训练 Stage 1 (maiG)        N epochs → 导出 hidden → 重建缓存
-  2. 训练 Stage 2 (Slide星星)   N epochs
-  3. 训练 Stage 3 (Hold时长)    N epochs
-  4. 训练 Stage 4 (TouchHold)   N epochs
-  5. 训练 Stage 5 (星星精炼)    N epochs
-  6. 训练 Stage 6 (Break绝赞)   N epochs
-  7. 训练 Stage 7 (Spike烟花)   N epochs
-  → 重复
-
-用法:
-  python scripts/train_cycle.py --cycles 20 --epochs-per-cycle 1  # 8 阶段流水线
-  python scripts/train_cycle.py --cycles 10 --epochs-per-cycle 2 --no-val
-"""
+"""Cycle training driver with terminal logging."""
 
 from __future__ import annotations
 
@@ -27,12 +11,23 @@ import time
 from pathlib import Path
 from typing import Any
 
-_PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+PYTHON = sys.executable
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("train_cycle")
 
-PYTHON = sys.executable
+
+def setup_file_logging(log_file: str | None) -> None:
+    if not log_file:
+        return
+    path = Path(log_file)
+    if path.parent != Path("."):
+        path.parent.mkdir(parents=True, exist_ok=True)
+    handler = logging.FileHandler(path, mode="a", encoding="utf-8")
+    handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+    logging.getLogger().addHandler(handler)
+    logger.info("Logging to %s", path)
 
 
 def stage_checkpoint(checkpoint_dir: str, stage: str, kind: str = "best") -> Path:
@@ -48,135 +43,155 @@ def stage_checkpoint(checkpoint_dir: str, stage: str, kind: str = "best") -> Pat
 def load_config(path: str | Path) -> dict[str, Any]:
     try:
         import yaml
-        with open(path, encoding='utf-8') as f:
-            return yaml.safe_load(f) or {}
-    except Exception:
+        return yaml.safe_load(Path(path).read_text(encoding="utf-8")) or {}
+    except Exception as exc:
+        logger.warning("Could not load config %s: %s", path, exc)
         return {}
 
 
 def stage_cycle_epochs(cfg: dict[str, Any], stage: str, override: int | None) -> int:
-    """读取每 stage 每循环的 epoch 数。"""
     if override is not None:
-        return override
+        return int(override)
     train_cfg = cfg.get("train", {}) or {}
     stage_cfg = (train_cfg.get("stages", {}) or {}).get(stage, {}) or {}
     return int(stage_cfg.get("epochs_per_cycle", train_cfg.get("epochs_per_cycle", 1)))
 
 
 def run(cmd: list[str], desc: str) -> bool:
-    logger.info("-" * 50)
+    logger.info("-" * 60)
     logger.info(desc)
-    logger.info(f"  {' '.join(cmd)}")
+    logger.info("Command: %s", " ".join(cmd))
     t0 = time.time()
-    r = subprocess.run(cmd, cwd=_PROJECT_ROOT)
+    proc = subprocess.Popen(
+        cmd,
+        cwd=PROJECT_ROOT,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        bufsize=1,
+    )
+    assert proc.stdout is not None
+    for line in proc.stdout:
+        logger.info("[%s] %s", Path(cmd[0]).name, line.rstrip())
+    returncode = proc.wait()
     elapsed = time.time() - t0
-    if r.returncode == 0:
-        logger.info(f"  ✅ {elapsed:.0f}s")
+    if returncode == 0:
+        logger.info("Done (%.0fs)", elapsed)
         return True
-    logger.error(f"  ❌ exit={r.returncode} {elapsed:.0f}s")
+    logger.error("Failed (exit=%s, %.0fs)", returncode, elapsed)
     return False
 
 
-def main():
-    p = argparse.ArgumentParser(description="循环训练 (epoch-based)")
+def main() -> None:
+    p = argparse.ArgumentParser(description="Cycle training driver")
     p.add_argument("--config", default="configs/rotating_4090.yaml")
     p.add_argument("--cache-root", default="/data/maiG_v2/cache")
     p.add_argument("--checkpoint-dir", default="/data/maiG_v2/runs/rotating_4090")
-    p.add_argument("--cycles", type=int, default=20, help="循环次数")
-    p.add_argument("--epochs-per-cycle", type=int, default=None,
-                   help="每阶段每轮训练 epoch 数；默认读取 config (1)")
-    p.add_argument("--no-val", action="store_true",
-                   help="禁用验证集划分")
-    p.add_argument("--skip-preprocess", action="store_true", default=True,
-                   help="跳过预处理 (默认)")
-    p.add_argument("--do-preprocess", action="store_true",
-                   help="先运行预处理再训练")
+    p.add_argument("--cycles", type=int, default=20)
+    p.add_argument("--epochs-per-cycle", type=int, default=None)
+    p.add_argument("--no-val", action="store_true")
+    p.add_argument("--skip-preprocess", action="store_true", default=True)
+    p.add_argument("--do-preprocess", action="store_true")
     p.add_argument("--num-workers", type=int, default=4)
+    p.add_argument("--log-file", default="terminal.log", help="Append terminal output to this file")
     args = p.parse_args()
+
+    setup_file_logging(args.log_file)
+    logger.info("train_cycle started")
+    logger.info(
+        "config=%s cache_root=%s checkpoint_dir=%s cycles=%s epochs_per_cycle=%s",
+        args.config,
+        args.cache_root,
+        args.checkpoint_dir,
+        args.cycles,
+        args.epochs_per_cycle,
+    )
 
     t_total = time.time()
     cfg = load_config(args.config)
 
-    # ── 预处理 ──
     if args.do_preprocess:
         maxsubdiv = int((cfg.get("data", {}) or {}).get("maxsubdiv", 64))
         if not run(
-            [PYTHON, "scripts/preprocess_all.py",
-             "--num-workers", str(args.num_workers),
-             "--maxsubdiv", str(maxsubdiv),
-             "--cache-root", args.cache_root],
-            "预处理"
+            [
+                PYTHON,
+                "scripts/preprocess_all.py",
+                "--num-workers",
+                str(args.num_workers),
+                "--maxsubdiv",
+                str(maxsubdiv),
+                "--cache-root",
+                args.cache_root,
+            ],
+            "Preprocess",
         ):
             sys.exit(1)
     else:
         cache_audio = Path(args.cache_root) / "_audio"
-        if not cache_audio.exists() or not list(cache_audio.glob("*.pt")):
-            logger.error(f"缓存为空: {cache_audio}")
-            logger.error("请先运行: python scripts/preprocess_all.py")
+        n_audio = len(list(cache_audio.glob("*.pt"))) if cache_audio.exists() else 0
+        if n_audio == 0:
+            logger.error("Audio cache is empty: %s", cache_audio)
+            logger.error("Run preprocessing first, or pass --do-preprocess")
             sys.exit(1)
-        logger.info(f"缓存就绪 ({len(list(cache_audio.glob('*.pt')))} 首)")
+        logger.info("Audio cache ready: %d files", n_audio)
 
-    # ── 构建传递给 train.py 的额外参数 ──
     extra_flags: list[str] = []
     if args.no_val:
         extra_flags.append("--no-val")
 
+    stage_order = [
+        ("stage2_star", "Stage 2 star detail"),
+        ("hold", "Stage 3 hold duration"),
+        ("touch_hold", "Stage 4 touch hold duration"),
+        ("stage5_touch", "Stage 5 touch pattern"),
+        ("stage6_break_note", "Stage 6 break note"),
+        ("stage7_firework_note", "Stage 7 firework note"),
+    ]
+
     for cycle in range(1, args.cycles + 1):
-        logger.info("")
         logger.info("=" * 60)
-        logger.info(f"  Cycle {cycle}/{args.cycles}")
+        logger.info("Cycle %d/%d", cycle, args.cycles)
         logger.info("=" * 60)
 
-        # 1. 训练 Stage 1（epoch-based）
-        E = stage_cycle_epochs(cfg, "stage1", args.epochs_per_cycle)
+        epochs = stage_cycle_epochs(cfg, "stage1", args.epochs_per_cycle)
         ckpt = stage_checkpoint(args.checkpoint_dir, "stage1", "last")
         resume_flag = ["--resume", str(ckpt)] if ckpt.exists() else []
         if not run(
-            [PYTHON, "train.py", "--config", args.config,
-             "--train-stage", "stage1", "--max-epochs", str(E)] + resume_flag + extra_flags,
-            f"[Cycle {cycle}] Stage 1 - maiG ({E} epochs)"
+            [PYTHON, "train.py", "--config", args.config, "--train-stage", "stage1", "--max-epochs", str(epochs)]
+            + resume_flag
+            + extra_flags,
+            f"[Cycle {cycle}] Train stage1 ({epochs} epochs)",
         ):
             sys.exit(1)
 
-        # 2. 重建缓存（使用 stage1 best checkpoint）
         ckpt = stage_checkpoint(args.checkpoint_dir, "stage1", "best")
         if not run(
-            [PYTHON, "scripts/build_stage234_cache.py",
-             "--step", "all", "--checkpoint", str(ckpt),
-             "--config", args.config, "--cache-root", args.cache_root],
-            f"[Cycle {cycle}] 导出 Hidden + 重建缓存"
+            [PYTHON, "scripts/build_stage234_cache.py", "--step", "all", "--checkpoint", str(ckpt), "--config", args.config, "--cache-root", args.cache_root],
+            f"[Cycle {cycle}] Export hidden + rebuild downstream caches",
         ):
             sys.exit(1)
 
-        # 3-9. 后续 7 个 Stage
-        stage_order = [
-            ("touch",      "Stage2 Touch触控"),
-            ("slide",      "Stage3 Slide星星"),
-            ("hold",       "Stage4 Hold时长"),
-            ("touch_hold", "Stage5 TouchHold时长"),
-            ("star",       "Stage6 星星精炼"),
-            ("break",      "Stage7 Break绝赞"),
-            ("spike",      "Stage8 Spike烟花"),
-        ]
-        for stage, name in stage_order:
-            E = stage_cycle_epochs(cfg, stage, args.epochs_per_cycle)
+        for stage, label in stage_order:
+            epochs = stage_cycle_epochs(cfg, stage, args.epochs_per_cycle)
             ckpt = stage_checkpoint(args.checkpoint_dir, stage, "last")
             resume_flag = ["--resume", str(ckpt)] if ckpt.exists() else []
             if not run(
-                [PYTHON, "train.py", "--config", args.config,
-                 "--train-stage", stage, "--max-epochs", str(E)] + resume_flag + extra_flags,
-                f"[Cycle {cycle}] {name} ({E} epochs)"
+                [PYTHON, "train.py", "--config", args.config, "--train-stage", stage, "--max-epochs", str(epochs)]
+                + resume_flag
+                + extra_flags,
+                f"[Cycle {cycle}] {label} ({epochs} epochs)",
             ):
                 sys.exit(1)
 
-        logger.info(f"Cycle {cycle} 完成")
+        logger.info("Cycle %d complete", cycle)
 
     total = time.time() - t_total
-    stages = ["stage1", "touch", "slide", "hold", "touch_hold", "star", "break", "spike"]
-    total_epochs = args.cycles * sum(stage_cycle_epochs(cfg, s, args.epochs_per_cycle) for s in stages)
+    total_epochs = args.cycles * (stage_cycle_epochs(cfg, "stage1", args.epochs_per_cycle) + sum(stage_cycle_epochs(cfg, s, args.epochs_per_cycle) for s, _ in stage_order))
     logger.info("=" * 60)
-    logger.info(f"🎉 全部 {args.cycles} 轮完成! ({total/3600:.1f}h, ~{total_epochs} total epochs)")
-    logger.info(f"  Checkpoint: {args.checkpoint_dir}/")
+    logger.info("All cycles complete: cycles=%d elapsed=%.1fh total_epochs~%d", args.cycles, total / 3600, total_epochs)
+    logger.info("Checkpoint dir: %s", args.checkpoint_dir)
     logger.info("=" * 60)
 
 

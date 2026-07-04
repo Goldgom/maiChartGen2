@@ -250,3 +250,153 @@ def print_dataset_info(cache_root: str | Path, prefix: str = "") -> dict[str, An
     logger.info(sep)
 
     return info
+
+
+def _fmt_bytes(n: int) -> str:
+    units = ["B", "KB", "MB", "GB", "TB"]
+    value = float(n)
+    for unit in units:
+        if value < 1024.0 or unit == units[-1]:
+            return f"{value:.1f}{unit}"
+        value /= 1024.0
+    return f"{value:.1f}TB"
+
+
+def _short_stats(values: list[float]) -> str:
+    if not values:
+        return "n=0"
+    return (
+        f"n={len(values)} min={min(values):.0f} mean={sum(values) / len(values):.1f} "
+        f"p50={_percentile(values, 50):.0f} p95={_percentile(values, 95):.0f} max={max(values):.0f}"
+    )
+
+
+def _path_chart_id(fp: Path, stage: str) -> str:
+    stem = fp.stem
+    if stage in {"slide", "stage2_star"}:
+        stem = stem.rsplit("_", 1)[0]
+    return stem
+
+
+def _path_song_id(fp: Path, stage: str) -> str:
+    import re
+
+    chart_id = _path_chart_id(fp, stage)
+    m = re.search(r"^(.*)_lv\d+$", chart_id)
+    return m.group(1) if m else chart_id
+
+
+def _tensor_len(data: dict[str, Any], keys: tuple[str, ...]) -> int | None:
+    for key in keys:
+        value = data.get(key)
+        if torch.is_tensor(value) and value.dim() >= 1:
+            return int(value.size(0))
+    return None
+
+
+def _dataset_items(dataset: Any) -> list[Path]:
+    items = getattr(dataset, "items", [])
+    return [Path(p) for p in items]
+
+
+def _inspect_items(items: list[Path], stage: str, max_load: int = 512) -> dict[str, Any]:
+    sizes = [fp.stat().st_size for fp in items if fp.exists()]
+    charts = {_path_chart_id(fp, stage) for fp in items}
+    songs = {_path_song_id(fp, stage) for fp in items}
+    token_lens: list[float] = []
+    onset_lens: list[float] = []
+    hidden_lens: list[float] = []
+    target_lens: list[float] = []
+    errors: list[str] = []
+
+    for fp in items[:max_load]:
+        try:
+            data = torch.load(fp, map_location="cpu", weights_only=True)
+        except Exception as exc:
+            errors.append(f"{fp.name}: {exc}")
+            continue
+        tok_len = _tensor_len(data, ("tokens", "config_tokens"))
+        if tok_len is not None:
+            token_lens.append(float(tok_len))
+        target_len = _tensor_len(data, ("target_path",))
+        if target_len is not None:
+            target_lens.append(float(target_len))
+        onset_len = _tensor_len(data, ("onset",))
+        if onset_len is not None:
+            onset_lens.append(float(onset_len))
+        hidden_len = _tensor_len(data, ("stage1_hidden", "audio_memory"))
+        if hidden_len is not None:
+            hidden_lens.append(float(hidden_len))
+
+    return {
+        "samples": len(items),
+        "charts": len(charts),
+        "songs": len(songs),
+        "bytes": sum(sizes),
+        "inspected": min(len(items), max_load),
+        "token_lens": token_lens,
+        "target_lens": target_lens,
+        "onset_lens": onset_lens,
+        "hidden_lens": hidden_lens,
+        "errors": errors[:10],
+        "examples": [fp.name for fp in items[:5]],
+    }
+
+
+def print_runtime_dataset_info(
+    stages: list[Any],
+    train_ids: set[str] | None = None,
+    val_ids: set[str] | None = None,
+    max_load_per_split: int = 512,
+) -> dict[str, Any]:
+    """Log the exact datasets wired into training after split/filtering."""
+    sep = "=" * 60
+    logger.info(sep)
+    logger.info("Runtime train/val dataset report")
+    logger.info(sep)
+    if train_ids is not None or val_ids is not None:
+        logger.info(
+            "Split ids: train=%d charts, val=%d charts",
+            len(train_ids or set()),
+            len(val_ids or set()),
+        )
+        if train_ids:
+            logger.info("  train id examples: %s", ", ".join(sorted(train_ids)[:12]))
+        if val_ids:
+            logger.info("  val id examples: %s", ", ".join(sorted(val_ids)[:12]))
+
+    report: dict[str, Any] = {}
+    for stage in stages:
+        stage_name = getattr(stage, "name", "unknown")
+        train_items = _dataset_items(stage.train_loader.dataset)
+        val_loader = getattr(stage, "val_loader", None)
+        val_items = _dataset_items(val_loader.dataset) if val_loader is not None else []
+        train_info = _inspect_items(train_items, stage_name, max_load=max_load_per_split)
+        val_info = _inspect_items(val_items, stage_name, max_load=max_load_per_split)
+        report[stage_name] = {"train": train_info, "val": val_info}
+
+        logger.info("Stage %s", stage_name)
+        for split_name, info in (("train", train_info), ("val", val_info)):
+            logger.info(
+                "  %s: samples=%d charts=%d songs=%d files=%s inspected=%d",
+                split_name,
+                info["samples"],
+                info["charts"],
+                info["songs"],
+                _fmt_bytes(info["bytes"]),
+                info["inspected"],
+            )
+            logger.info("    token/config len: %s", _short_stats(info["token_lens"]))
+            if info["target_lens"]:
+                logger.info("    target_path len: %s", _short_stats(info["target_lens"]))
+            if info["onset_lens"]:
+                logger.info("    onset len: %s", _short_stats(info["onset_lens"]))
+            if info["hidden_lens"]:
+                logger.info("    hidden/audio len: %s", _short_stats(info["hidden_lens"]))
+            if info["examples"]:
+                logger.info("    examples: %s", ", ".join(info["examples"]))
+            if info["errors"]:
+                logger.warning("    load errors: %s", "; ".join(info["errors"]))
+
+    logger.info(sep)
+    return report

@@ -444,7 +444,7 @@ class RotatingMultiStageTrainer:
         # pbar: epoch 模式下按样本数显示，turn 模式下按 turn 数显示
         if tqdm is not None:
             if max_epochs is not None:
-                total_samples = sum(stage_dataset_size.values())
+                total_samples = sum(stage_dataset_size.values()) * max(1, int(max_epochs))
                 pbar = tqdm(total=total_samples, initial=0, desc="epoch", unit="samp", dynamic_ncols=True)
             elif max_turns is not None:
                 pbar = tqdm(total=max_turns, initial=self.global_turn, desc="turns", dynamic_ncols=True)

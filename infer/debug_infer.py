@@ -32,12 +32,18 @@ def main():
     DEBUG_OUT = TEST_DIR / "debug_outputs"
     CHECKPOINT_DIR = Path("/data/maiG_v2/runs/rotating_4090")
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+    BREAK_GENERATION_PROB = float(os.getenv("BREAK_GENERATION_PROB", "0.08"))
+    SPIKE_GENERATION_PROB = float(os.getenv("SPIKE_GENERATION_PROB", "0.05"))
+    PROB_SELECTION_MODE = os.getenv("PROB_SELECTION_MODE", "topk")
+    PROB_SELECTION_TEMPERATURE = float(os.getenv("PROB_SELECTION_TEMPERATURE", "1.0"))
 
     print(f"{'='*60}")
     print(f"  maiG_v2 Full Inference Debug")
     print(f"  Test: {TEST_DIR}")
     print(f"  Device: {DEVICE}")
     print(f"  Output: {DEBUG_OUT}")
+    print(f"  Break rate: {BREAK_GENERATION_PROB:.4f}")
+    print(f"  Spike rate: {SPIKE_GENERATION_PROB:.4f}")
     print(f"{'='*60}")
 
     # 创建输出目录
@@ -274,6 +280,7 @@ E"""
     print("\n[Step 5] Break Stage — Classifying TAP vs BREAK...")
 
     from models.break_stage import BreakClassifier
+    from infer.break_infer import generate_break_mask
 
     break_model = BreakClassifier(
         hidden_dim=384,
@@ -298,12 +305,23 @@ E"""
             tokens_t.to(DEVICE),
             stage1_hidden.to(DEVICE),
         )  # [1, T, 8, 2]
+        break_mask, break_probs = generate_break_mask(
+            break_model,
+            tokens_t.to(DEVICE),
+            stage1_hidden.to(DEVICE),
+            break_generation_prob=BREAK_GENERATION_PROB,
+            mode=PROB_SELECTION_MODE,
+            temperature=PROB_SELECTION_TEMPERATURE,
+        )
 
-    break_preds = break_logits.argmax(dim=-1).cpu()  # [1, T, 8]
-    print(f"  → Break logits: {break_logits.shape}")
-    print(f"  → Break predictions (first 10 positions):\n{break_preds[0, :10, :]}")
+    break_preds = break_mask.cpu()  # [1, T, 8]
+    print(f"  -> Break logits: {break_logits.shape}")
+    print(f"  -> Break selected: {int(break_preds.sum().item())}")
+    print(f"  -> Break predictions (first 10 positions):\n{break_preds[0, :10, :]}")
 
     torch.save(break_logits.cpu(), run_dir / "05_break_logits.pt")
+    torch.save(break_probs.cpu(), run_dir / "05_break_probs.pt")
+    torch.save(break_preds, run_dir / "05_break_mask.pt")
     torch.save(break_preds, run_dir / "05_break_preds.pt")
 
     # ============================================================
@@ -409,6 +427,7 @@ E"""
     print("\n[Step 7] Spike Stage — Classifying Touch Spikes...")
 
     from models.spike_stage import SpikeClassifier
+    from infer.spike_infer import generate_spike_mask
 
     spike_model = SpikeClassifier(
         hidden_dim=384,
@@ -433,11 +452,22 @@ E"""
             tokens_t.to(DEVICE),
             stage1_hidden.to(DEVICE),
         )  # [1, T, 33, 2]
+        spike_mask, spike_probs = generate_spike_mask(
+            spike_model,
+            tokens_t.to(DEVICE),
+            stage1_hidden.to(DEVICE),
+            spike_generation_prob=SPIKE_GENERATION_PROB,
+            mode=PROB_SELECTION_MODE,
+            temperature=PROB_SELECTION_TEMPERATURE,
+        )
 
-    spike_preds = spike_logits.argmax(dim=-1).cpu()  # [1, T, 33]
-    print(f"  → Spike logits: {spike_logits.shape}")
+    spike_preds = spike_mask.cpu()  # [1, T, 33]
+    print(f"  -> Spike logits: {spike_logits.shape}")
+    print(f"  -> Spike selected: {int(spike_preds.sum().item())}")
 
     torch.save(spike_logits.cpu(), run_dir / "07_spike_logits.pt")
+    torch.save(spike_probs.cpu(), run_dir / "07_spike_probs.pt")
+    torch.save(spike_preds, run_dir / "07_spike_mask.pt")
     torch.save(spike_preds, run_dir / "07_spike_preds.pt")
 
     # ============================================================
@@ -497,6 +527,10 @@ E"""
         "genre": GENRE,
         "stage1_num_tokens": len(generated_tokens),
         "checkpoint_dir": str(CHECKPOINT_DIR),
+        "break_generation_prob": BREAK_GENERATION_PROB,
+        "spike_generation_prob": SPIKE_GENERATION_PROB,
+        "prob_selection_mode": PROB_SELECTION_MODE,
+        "prob_selection_temperature": PROB_SELECTION_TEMPERATURE,
         "output_files": sorted([f.name for f in run_dir.iterdir()]),
     }
     with open(run_dir / "00_summary.json", "w") as f:

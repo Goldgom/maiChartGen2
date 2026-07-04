@@ -6,6 +6,7 @@ os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 import argparse
 import ast
 import json
+import math
 from pathlib import Path
 from typing import Any
 
@@ -311,10 +312,11 @@ def main():
             trainer.load(args.resume)
 
     # ── 训练前数据集报告 ──
-    from train.dataset_info import print_dataset_info
+    from train.dataset_info import print_dataset_info, print_runtime_dataset_info
     cache_root = cfg.get("data", {}).get("cache_root", "cache")
     stage_label = args.train_stage or "all"
     print_dataset_info(cache_root, prefix=stage_label)
+    print_runtime_dataset_info(stages, train_ids=train_ids, val_ids=val_ids)
 
     # ── 确定训练上限 ──
     if args.max_turns is not None:
@@ -339,7 +341,7 @@ def main():
         train_n = len(s.train_loader.dataset)
         val_n = len(s.val_loader.dataset) if s.val_loader else 0
         batch_size = max(1, int(cfg["train"].get("batch_size", 1)))
-        turns_per_epoch = max(1, train_n // max(1, s.turn_batches * batch_size))
+        turns_per_epoch = max(1, math.ceil(train_n / max(1, s.turn_batches * batch_size)))
         log.info(
             "  %s: train=%d  val=%d  ~%d turns/epoch",
             s.name, train_n, val_n, turns_per_epoch,

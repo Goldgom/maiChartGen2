@@ -1,21 +1,10 @@
 """
-一键预处理: 从原始数据到完整训练缓存
+Run the preprocessing pipeline from raw dataset files to training caches.
 
-依次执行:
-  1. preprocess_audio.py   → cache/_audio/    (音频特征)
-  2. preprocess_labels.py  → cache/_labels/   (标注)
-                            → cache/stage1/   (Stage 1 训练数据)
-                            → cache/slide/    (Slide 训练数据)
-
-用法:
-  python scripts/preprocess_all.py                          # 全部
-  python scripts/preprocess_all.py --limit 50               # 前50首测试
-  python scripts/preprocess_all.py --num-workers 4          # 4线程
-  python scripts/preprocess_all.py --skip-existing          # 跳过已有
-  python scripts/preprocess_all.py --steps audio            # 只跑音频
-
-Stage 1 训练完成后，运行 Phase 2b:
-  python scripts/build_stage234_cache.py --step all --checkpoint /data/maiG_v2/runs/.../best.pt
+Steps:
+  1. preprocess_audio.py   -> cache/_audio/
+  2. preprocess_labels.py  -> cache/_labels/, cache/stage1/, stage detail caches
+  3. build_stage234_cache.py placeholder downstream caches
 """
 
 from __future__ import annotations
@@ -28,15 +17,15 @@ import sys
 import time
 from pathlib import Path
 
-_PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("preprocess_all")
 
 STEPS = {
-    "audio":  ("scripts/preprocess_audio.py",  "Phase 1: 音频特征 → cache/_audio/"),
-    "labels": ("scripts/preprocess_labels.py", "Phase 2a: 标签 + Stage1/Slide → cache/"),
-    "cache234": ("scripts/build_stage234_cache.py", "Phase 2b: Touch/Break/Spike 缓存 (占位)"),
+    "audio": ("scripts/preprocess_audio.py", "Phase 1: audio features -> cache/_audio/"),
+    "labels": ("scripts/preprocess_labels.py", "Phase 2a: labels + stage caches"),
+    "cache234": ("scripts/build_stage234_cache.py", "Phase 2b: placeholder downstream caches"),
 }
 
 
@@ -46,9 +35,8 @@ def run_step(script: str, description: str, args: argparse.Namespace) -> bool:
     logger.info("=" * 60)
     t0 = time.time()
 
-    cmd = [sys.executable, str(Path(_PROJECT_ROOT) / script)]
+    cmd = [sys.executable, str(PROJECT_ROOT / script)]
 
-    # 通用参数 (仅 audio & labels)
     if "build_stage234" not in script:
         if args.num_workers:
             cmd.extend(["--num-workers", str(args.num_workers)])
@@ -56,19 +44,15 @@ def run_step(script: str, description: str, args: argparse.Namespace) -> bool:
             cmd.extend(["--data-root", args.data_root])
         if args.limit:
             cmd.extend(["--limit", str(args.limit)])
-        # 默认跳过已有缓存，--force 强制重跑
         if args.force:
             cmd.append("--force")
 
-    # audio 专用
     if "audio" in script:
         if args.subdiv:
             cmd.extend(["--subdiv", str(args.subdiv)])
-        # 音频存到独立子目录
         cmd.extend(["--cache-root", str(Path(args.cache_root) / "_audio")])
         cmd.extend(["--encodec-layers", str(args.encodec_layers)])
 
-    # labels 专用
     if "labels" in script:
         if args.subdiv:
             cmd.extend(["--subdiv", str(args.subdiv)])
@@ -78,76 +62,86 @@ def run_step(script: str, description: str, args: argparse.Namespace) -> bool:
             cmd.extend(["--max-tokens", str(args.max_tokens)])
         cmd.extend(["--cache-root", str(args.cache_root)])
 
-    # build_stage234 专用 — 只传必要参数
     if "build_stage234" in script:
         cmd.extend(["--step", "build-caches", "--placeholder", "--cache-root", str(args.cache_root)])
         cmd.extend(["--config", "configs/rotating_4090.yaml"])
         if args.limit:
             cmd.extend(["--limit", str(args.limit)])
 
-    logger.info(f"  命令: {' '.join(cmd)}")
-    result = subprocess.run(cmd, cwd=_PROJECT_ROOT)
+    logger.info("Command: %s", " ".join(cmd))
+    env = os.environ.copy()
+    env.setdefault("PYTHONUNBUFFERED", "1")
+    env.setdefault("PYTHONIOENCODING", "utf-8")
+    proc = subprocess.Popen(
+        cmd,
+        cwd=PROJECT_ROOT,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        bufsize=1,
+        env=env,
+    )
+    assert proc.stdout is not None
+    for line in proc.stdout:
+        logger.info("[%s] %s", Path(script).stem, line.rstrip())
+    returncode = proc.wait()
 
     elapsed = time.time() - t0
-    if result.returncode == 0:
-        logger.info(f"  ✅ 完成 ({elapsed:.0f}s)")
+    if returncode == 0:
+        logger.info("Done (%.0fs)", elapsed)
         return True
-    else:
-        logger.error(f"  ❌ 失败 (exit={result.returncode}, {elapsed:.0f}s)")
-        return False
+
+    logger.error("Failed (exit=%s, %.0fs)", returncode, elapsed)
+    return False
 
 
-def main():
-    p = argparse.ArgumentParser(description="一键预处理")
-    p.add_argument("--steps", default="all", help="执行的步骤: audio, labels, all")
+def main() -> None:
+    p = argparse.ArgumentParser(description="Run preprocessing pipeline")
+    p.add_argument("--steps", default="all", help="Steps to run: audio, labels, cache234, all")
     p.add_argument("--data-root", default="datasets")
     p.add_argument("--cache-root", default="/data/maiG_v2/cache")
-    p.add_argument("--limit", type=int, default=None, help="限制歌曲数 (测试用)")
-    p.add_argument("--num-workers", type=int, default=1, help="并行线程数")
+    p.add_argument("--limit", type=int, default=None, help="Limit song count for testing")
+    p.add_argument("--num-workers", type=int, default=1, help="Parallel worker count")
     p.add_argument("--subdiv", type=int, default=64)
     p.add_argument("--max-tokens", type=int, default=16384)
-    p.add_argument("--maxsubdiv", type=int, default=64, help="谱面归一化网格精度")
-    p.add_argument("--force", action="store_true", help="强制重新处理")
-    p.add_argument("--encodec-layers", type=int, default=1, help="EnCodec 层数 (1/2)")
+    p.add_argument("--maxsubdiv", type=int, default=64, help="Normalized chart subdivision")
+    p.add_argument("--force", action="store_true", help="Rebuild existing cache files")
+    p.add_argument("--encodec-layers", type=int, default=1, help="EnCodec layer count (1/2)")
     args = p.parse_args()
 
     steps_to_run = ["audio", "labels", "cache234"] if args.steps == "all" else [s.strip() for s in args.steps.split(",")]
     unknown = set(steps_to_run) - set(STEPS)
     if unknown:
-        logger.error(f"未知步骤: {unknown}. 可选: {list(STEPS)}")
+        logger.error("Unknown steps: %s. Available: %s", unknown, list(STEPS))
         sys.exit(1)
 
     t_total = time.time()
-    failed = []
-
+    failed: list[str] = []
     for step_name in steps_to_run:
         script, desc = STEPS[step_name]
         if not run_step(script, desc, args):
             failed.append(step_name)
-            logger.error(f"步骤 '{step_name}' 失败，停止后续步骤")
+            logger.error("Step '%s' failed; stopping pipeline.", step_name)
             break
 
     total_elapsed = time.time() - t_total
     if failed:
-        logger.error(f"预处理未完成! 失败步骤: {failed} ({total_elapsed:.0f}s)")
-        logger.info("")
-        logger.info("提示:")
-        logger.info("  1. 确保已安装依赖: pip install librosa soundfile torch")
-        logger.info("  2. 使用 --skip-existing 跳过已成功的文件续跑")
-        logger.info("  3. 单线程更稳定: --num-workers 1")
+        logger.error("Preprocess failed. Failed steps: %s (%.0fs)", failed, total_elapsed)
+        logger.info("Hints:")
+        logger.info("  1. Make sure dependencies are installed: pip install librosa soundfile torch")
+        logger.info("  2. Re-run without --force to keep existing successful cache files")
+        logger.info("  3. Use --num-workers 1 for the most stable logs")
         sys.exit(1)
-    else:
-        logger.info("=" * 60)
-        logger.info(f"🎉 全部完成! ({total_elapsed:.0f}s)")
-        logger.info("=" * 60)
-        logger.info("")
-        logger.info("下一步:")
-        logger.info("  训练:")
-        logger.info("     python train.py --config configs/rotating_4090.yaml")
-        logger.info("")
-        logger.info("  (Stage 1 训练完成后, 用真实 hidden 替换占位缓存:)")
-        logger.info("     python scripts/build_stage234_cache.py --step all \\")
-        logger.info("         --checkpoint /data/maiG_v2/runs/rotating_4090/best.pt")
+
+    logger.info("=" * 60)
+    logger.info("All preprocessing steps completed. (%.0fs)", total_elapsed)
+    logger.info("=" * 60)
+    logger.info("Next:")
+    logger.info("  python train.py --config configs/rotating_4090.yaml")
+    logger.info("  After Stage 1 training, rebuild downstream caches with real hidden states:")
+    logger.info("  python scripts/build_stage234_cache.py --step all --checkpoint /data/maiG_v2/runs/rotating_4090/best.pt")
 
 
 if __name__ == "__main__":
