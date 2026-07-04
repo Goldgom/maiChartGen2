@@ -7,9 +7,11 @@ import torch
 
 from models.stage1 import MaiGenerator
 from models.touch_stage import TouchRefiner
-from models.slide_stage import SlidePathGenerator
+from models.slide_stage import SlidePathGenerator, SlideStarRefiner
+from models.hold_stage import HoldDurationPredictor, TouchHoldDurationPredictor
 from models.break_stage import BreakClassifier
 from models.spike_stage import SpikeClassifier
+from models.touch_pattern_stage import TouchPatternRefiner
 
 
 def _ensure_batch_dim(x: torch.Tensor) -> torch.Tensor:
@@ -77,14 +79,26 @@ def touch_step(model: TouchRefiner, batch: dict[str, Any], device: torch.device)
 
 
 def slide_step(model: SlidePathGenerator, batch: dict[str, Any], device: torch.device):
-    audio_memory = _as_batch(batch["audio_memory"]).to(device)
     target_path = _as_batch(batch["target_path"]).to(device)
+    audio_memory = batch.get("audio_memory")
+    if audio_memory is None:
+        in_dim = getattr(getattr(model, "audio_proj", None), "in_features", 768)
+        audio_memory = torch.zeros(target_path.size(0), 1, in_dim)
+    audio_memory = _as_batch(audio_memory).to(device)
+    start_pos = batch["start_pos"]
+    if not torch.is_tensor(start_pos):
+        start_pos = torch.as_tensor(start_pos, dtype=torch.long)
+    stage1_hidden = batch.get("stage1_hidden")
+    if stage1_hidden is not None:
+        stage1_hidden = _as_batch(stage1_hidden).to(device)
+    onset = batch.get("onset")
+    if onset is not None:
+        onset = _as_batch(onset).to(device)
+
     out = model(
-        target_path,
-        batch["start_pos"].to(device),
-        batch["end_pos"].to(device),
-        batch["duration"].to(device),
-        audio_memory,
+        target_path, start_pos, audio_memory,
+        stage1_hidden=stage1_hidden,
+        onset=onset,
     )
     return out["loss"], {"loss": float(out["loss"].detach().item())}
 
@@ -107,3 +121,79 @@ def spike_step(model: SpikeClassifier, batch: dict[str, Any], device: torch.devi
     logits = model(tokens, stage1_hidden)
     loss = model.compute_loss(logits, targets, touch_mask)
     return loss, {"loss": float(loss.detach().item())}
+
+
+# ── Stage 3: Hold 持续时间预测 ──
+
+def hold_step(model: HoldDurationPredictor, batch: dict[str, Any], device: torch.device):
+    tokens = _as_batch(batch["tokens"]).to(device)
+    stage1_hidden = _as_batch(batch["stage1_hidden"]).to(device)
+    num_targets = _as_batch(batch["dur_num_targets"]).to(device)
+    den_targets = _as_batch(batch["dur_den_targets"]).to(device)
+    hold_mask = _as_batch(batch["hold_mask"]).bool().to(device)
+
+    audio_memory = batch.get("audio_memory")
+    if audio_memory is not None:
+        audio_memory = _as_batch(audio_memory).to(device)
+    onset = batch.get("onset")
+    if onset is not None:
+        onset = _as_batch(onset).to(device)
+
+    out = model(tokens, stage1_hidden, audio_memory=audio_memory, onset=onset)
+    loss = model.compute_loss(out, num_targets, den_targets, hold_mask)
+    return loss, {"loss": float(loss.detach().item())}
+
+
+# ── Stage 4: Touch Hold 持续时间预测 ──
+
+def touch_hold_step(model: TouchHoldDurationPredictor, batch: dict[str, Any], device: torch.device):
+    tokens = _as_batch(batch["tokens"]).to(device)
+    stage1_hidden = _as_batch(batch["stage1_hidden"]).to(device)
+    num_targets = _as_batch(batch["dur_num_targets"]).to(device)
+    den_targets = _as_batch(batch["dur_den_targets"]).to(device)
+    hold_mask = _as_batch(batch["touch_hold_mask"]).bool().to(device)
+
+    audio_memory = batch.get("audio_memory")
+    if audio_memory is not None:
+        audio_memory = _as_batch(audio_memory).to(device)
+    onset = batch.get("onset")
+    if onset is not None:
+        onset = _as_batch(onset).to(device)
+
+    out = model(tokens, stage1_hidden, audio_memory=audio_memory, onset=onset)
+    loss = model.compute_loss(out, num_targets, den_targets, hold_mask)
+    return loss, {"loss": float(loss.detach().item())}
+
+
+def touch_pattern_step(model: TouchPatternRefiner, batch: dict[str, Any], device: torch.device):
+    tokens = _as_batch(batch["tokens"]).to(device)
+    stage1_hidden = _as_batch(batch["stage1_hidden"]).to(device)
+    pattern_targets = _as_batch(batch["touch_pattern_targets"]).to(device)
+    touch_mask = _as_batch(batch["touch_pattern_mask"]).bool().to(device)
+
+    audio_memory = batch.get("audio_memory")
+    if audio_memory is not None:
+        audio_memory = _as_batch(audio_memory).to(device)
+
+    logits = model(tokens, stage1_hidden, audio_memory=audio_memory)
+    loss = model.compute_loss(logits, pattern_targets, touch_mask)
+    return loss, {"loss": float(loss.detach().item())}
+
+
+# ── Stage 5: Slide Star 精炼 ──
+
+def star_step(model: SlideStarRefiner, batch: dict[str, Any], device: torch.device):
+    coarse_path = _as_batch(batch["coarse_path"]).to(device)
+    target_path = _as_batch(batch["target_path"]).to(device)
+    stage1_hidden = _as_batch(batch["stage1_hidden"]).to(device)
+
+    audio_memory = batch.get("audio_memory")
+    if audio_memory is not None:
+        audio_memory = _as_batch(audio_memory).to(device)
+    onset = batch.get("onset")
+    if onset is not None:
+        onset = _as_batch(onset).to(device)
+
+    out = model(coarse_path, stage1_hidden,
+                audio_memory=audio_memory, onset=onset, target_path=target_path)
+    return out["loss"], {"loss": float(out["loss"].detach().item())}

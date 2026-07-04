@@ -1,17 +1,18 @@
 """
-循环训练: Stage 1 ↔ Stage 2/3/4 交替训练
+循环训练: 7 阶段流水线交替训练
 
 每轮循环 (以 epoch 为单位，1 epoch = 全量数据过一遍):
-  1. 训练 Stage 1 (N epochs)  →  每 epoch 后验证集评估，判断 best
-  2. 导出 Stage 1 hidden → 重建 Touch/Break/Spike/Slide 缓存
-  3. 训练 Stage 2 (Touch)   N epochs
-  4. 训练 Stage 2.5 (Slide) N epochs
-  5. 训练 Stage 3 (Break)   N epochs
-  6. 训练 Stage 4 (Spike)   N epochs
+  1. 训练 Stage 1 (maiG)        N epochs → 导出 hidden → 重建缓存
+  2. 训练 Stage 2 (Slide星星)   N epochs
+  3. 训练 Stage 3 (Hold时长)    N epochs
+  4. 训练 Stage 4 (TouchHold)   N epochs
+  5. 训练 Stage 5 (星星精炼)    N epochs
+  6. 训练 Stage 6 (Break绝赞)   N epochs
+  7. 训练 Stage 7 (Spike烟花)   N epochs
   → 重复
 
 用法:
-  python scripts/train_cycle.py --cycles 20 --epochs-per-cycle 1
+  python scripts/train_cycle.py --cycles 20 --epochs-per-cycle 1  # 8 阶段流水线
   python scripts/train_cycle.py --cycles 10 --epochs-per-cycle 2 --no-val
 """
 
@@ -47,7 +48,7 @@ def stage_checkpoint(checkpoint_dir: str, stage: str, kind: str = "best") -> Pat
 def load_config(path: str | Path) -> dict[str, Any]:
     try:
         import yaml
-        with open(path) as f:
+        with open(path, encoding='utf-8') as f:
             return yaml.safe_load(f) or {}
     except Exception:
         return {}
@@ -98,9 +99,11 @@ def main():
 
     # ── 预处理 ──
     if args.do_preprocess:
+        maxsubdiv = int((cfg.get("data", {}) or {}).get("maxsubdiv", 64))
         if not run(
             [PYTHON, "scripts/preprocess_all.py",
              "--num-workers", str(args.num_workers),
+             "--maxsubdiv", str(maxsubdiv),
              "--cache-root", args.cache_root],
             "预处理"
         ):
@@ -131,7 +134,7 @@ def main():
         if not run(
             [PYTHON, "train.py", "--config", args.config,
              "--train-stage", "stage1", "--max-epochs", str(E)] + resume_flag + extra_flags,
-            f"[Cycle {cycle}] Stage 1 训练 ({E} epochs)"
+            f"[Cycle {cycle}] Stage 1 - maiG ({E} epochs)"
         ):
             sys.exit(1)
 
@@ -145,23 +148,31 @@ def main():
         ):
             sys.exit(1)
 
-        # 3-6. Stage 2/2.5/3/4（epoch-based）
-        for stage, name in [("touch", "Touch"), ("slide", "Slide"),
-                            ("break", "Break"), ("spike", "Spike")]:
+        # 3-9. 后续 7 个 Stage
+        stage_order = [
+            ("touch",      "Stage2 Touch触控"),
+            ("slide",      "Stage3 Slide星星"),
+            ("hold",       "Stage4 Hold时长"),
+            ("touch_hold", "Stage5 TouchHold时长"),
+            ("star",       "Stage6 星星精炼"),
+            ("break",      "Stage7 Break绝赞"),
+            ("spike",      "Stage8 Spike烟花"),
+        ]
+        for stage, name in stage_order:
             E = stage_cycle_epochs(cfg, stage, args.epochs_per_cycle)
             ckpt = stage_checkpoint(args.checkpoint_dir, stage, "last")
             resume_flag = ["--resume", str(ckpt)] if ckpt.exists() else []
             if not run(
                 [PYTHON, "train.py", "--config", args.config,
                  "--train-stage", stage, "--max-epochs", str(E)] + resume_flag + extra_flags,
-                f"[Cycle {cycle}] Stage - {name} ({E} epochs)"
+                f"[Cycle {cycle}] {name} ({E} epochs)"
             ):
                 sys.exit(1)
 
         logger.info(f"Cycle {cycle} 完成")
 
     total = time.time() - t_total
-    stages = ["stage1", "touch", "slide", "break", "spike"]
+    stages = ["stage1", "touch", "slide", "hold", "touch_hold", "star", "break", "spike"]
     total_epochs = args.cycles * sum(stage_cycle_epochs(cfg, s, args.epochs_per_cycle) for s in stages)
     logger.info("=" * 60)
     logger.info(f"🎉 全部 {args.cycles} 轮完成! ({total/3600:.1f}h, ~{total_epochs} total epochs)")

@@ -40,3 +40,5 @@ tests/
 web_outputs/
 *.swp
 .DS_Store
+
+debug

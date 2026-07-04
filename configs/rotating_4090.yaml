@@ -7,6 +7,7 @@ use_bf16: true
 data:
   cache_root: /data/maiG_v2/cache
   num_workers: 6
+  maxsubdiv: 64              # 谱面归一化网格精度，每 slot = 1/maxsubdiv 拍
 
 # EnCodec 音频编码参数
 audio_encodec:
@@ -74,6 +75,12 @@ optim:
       lr: 0.0003
     spike:
       lr: 0.0003
+    hold:
+      lr: 0.0003
+    touch_hold:
+      lr: 0.0003
+    star:
+      lr: 0.0002
 
 sched:
   name: constant
@@ -90,6 +97,12 @@ sched:
       warmup_steps: 0
     spike:
       warmup_steps: 0
+    hold:
+      warmup_steps: 200
+    touch_hold:
+      warmup_steps: 200
+    star:
+      warmup_steps: 200
 
 checkpoint:
   dir: /data/maiG_v2/runs/rotating_4090
@@ -125,6 +138,11 @@ models:
     hidden_dim: 768
     num_layers: 6
     num_heads: 12
+  stage5_touch:
+    hidden_dim: 384
+    num_layers: 4
+    num_heads: 6
+    stage1_dim: 768
   slide:
     hidden_dim: 512
     num_layers: 6
@@ -134,6 +152,18 @@ models:
     num_layers: 4
     num_heads: 6
   spike:
+    hidden_dim: 384
+    num_layers: 4
+    num_heads: 6
+  hold:
+    hidden_dim: 384
+    num_layers: 4
+    num_heads: 6
+  touch_hold:
+    hidden_dim: 384
+    num_layers: 4
+    num_heads: 6
+  star:
     hidden_dim: 384
     num_layers: 4
     num_heads: 6

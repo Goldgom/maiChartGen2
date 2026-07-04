@@ -33,8 +33,41 @@ class StageCacheDataset(Dataset):
         stage_root = self.root / stage
         self.items = sorted(stage_root.glob("*.pt")) if stage_root.exists() else []
         self._slide_audio_cache: dict[str, torch.Tensor] = {}
+        self.items = self._filter_supervised(self.items)
         if max_tokens is not None or max_onset is not None:
             self.items = self._filter_by_length(self.items, max_tokens, max_onset)
+
+    def _has_supervision(self, data: dict[str, Any]) -> bool:
+        if self.stage == "hold":
+            return bool(torch.as_tensor(data.get("hold_mask", False)).bool().any().item())
+        if self.stage == "touch_hold":
+            return bool(torch.as_tensor(data.get("touch_hold_mask", False)).bool().any().item())
+        if self.stage == "stage5_touch":
+            return bool(torch.as_tensor(data.get("touch_pattern_mask", False)).bool().any().item())
+        if self.stage == "touch":
+            return bool(torch.as_tensor(data.get("zone_targets", 0)).gt(0).any().item())
+        if self.stage in {"break", "stage6_break_note"}:
+            return bool(torch.as_tensor(data.get("press_mask", False)).bool().any().item())
+        if self.stage in {"spike", "stage7_firework_note"}:
+            return bool(torch.as_tensor(data.get("touch_mask", False)).bool().any().item())
+        return True
+
+    def _filter_supervised(self, items: list[Path]) -> list[Path]:
+        kept: list[Path] = []
+        skipped = 0
+        for fp in items:
+            try:
+                data = torch.load(fp, map_location="cpu", weights_only=True)
+            except Exception:
+                kept.append(fp)
+                continue
+            if self._has_supervision(data):
+                kept.append(fp)
+            else:
+                skipped += 1
+        if skipped:
+            logger.info("Stage '%s': skipped %d files without supervision", self.stage, skipped)
+        return kept
 
     def _filter_by_length(
         self,
@@ -76,26 +109,30 @@ class StageCacheDataset(Dataset):
 
     def __getitem__(self, idx: int) -> dict[str, Any]:
         data = torch.load(self.items[idx], map_location="cpu", weights_only=True)
-        if self.stage == "slide":
-            song_id = self.items[idx].stem.rsplit("_", 1)[0]
+        if self.stage in {"slide", "stage2_star"}:
+            chart_id = _extract_chart_id(self.items[idx], self.stage)
+            song_id = _strip_lv_suffix(chart_id)
             audio_memory = self._slide_audio_cache.get(song_id)
             if audio_memory is None:
-                hidden_path = self.root / "_hidden" / f"{song_id}.pt"
-                if hidden_path.exists():
-                    hidden = torch.load(hidden_path, map_location="cpu", weights_only=True)
+                # 查找该歌曲任意图表的 hidden（audio_memory 全曲共享）
+                found = list((self.root / "_hidden").glob(f"{song_id}_lv*.pt"))
+                if found:
+                    hidden = torch.load(found[0], map_location="cpu", weights_only=True)
                     audio_memory = hidden.get("audio_memory")
-                    if torch.is_tensor(audio_memory):
-                        # ── NaN 检查：发现则替换为 0 ──
-                        if torch.isnan(audio_memory).any():
-                            logger.warning(
-                                "Slide audio_memory 含 NaN: _hidden/%s.pt，已替换为 0",
-                                song_id,
-                            )
-                            audio_memory = torch.nan_to_num(audio_memory, nan=0.0)
-                        self._slide_audio_cache[song_id] = audio_memory
+                # fallback: 旧格式 _hidden/{song_id}.pt
+                elif (self.root / "_hidden" / f"{song_id}.pt").exists():
+                    hidden = torch.load(self.root / "_hidden" / f"{song_id}.pt", map_location="cpu", weights_only=True)
+                    audio_memory = hidden.get("audio_memory")
+                if torch.is_tensor(audio_memory):
+                    if torch.isnan(audio_memory).any():
+                        logger.warning(
+                            "Slide audio_memory 含 NaN: _hidden/%s，已替换为 0", song_id,
+                        )
+                        audio_memory = torch.nan_to_num(audio_memory, nan=0.0)
+                    self._slide_audio_cache[song_id] = audio_memory
             if torch.is_tensor(audio_memory):
                 data["audio_memory"] = audio_memory
-        data["_file"] = str(self.items[idx])  # OOM 调试用
+        data["_file"] = str(self.items[idx])
         return data
 
 
@@ -185,12 +222,33 @@ def build_loader(dataset: Dataset, batch_size: int, shuffle: bool, num_workers: 
 # ── Train / Val Split ─────────────────────────────────────────────────────
 
 def _extract_song_id(filepath: Path, stage: str) -> str:
-    """从缓存文件路径中提取 song_id。"""
+    """从缓存文件路径中提取原始 song_id（去掉 _lv{N} 后缀）。"""
     stem = filepath.stem
-    if stage == "stage1":
-        return stem
-    # touch/break/spike: {song_id}_{idx}, slide: {song_id}_{idx}
-    return stem.rsplit("_", 1)[0]
+    # stage1: {song_id}_lv{N}
+    # touch/break/spike: {song_id}_lv{N}_{idx}
+    # slide: {song_id}_lv{N}_{idx:03d}
+    # 先去掉最后的 _{idx} / _{idx:03d}
+    if stage != "stage1":
+        stem = stem.rsplit("_", 1)[0]
+    # 再去掉 _lv{N}
+    return _strip_lv_suffix(stem)
+
+
+def _extract_chart_id(filepath: Path, stage: str) -> str:
+    """从缓存文件路径中提取完整 chart_id ({song_id}_lv{N})。"""
+    stem = filepath.stem
+    # slide: {song_id}_lv{N}_{idx:03d} → 去掉最后一个 _{idx}
+    # touch/break/spike/hold/touch_hold: {song_id}_lv{N} → 就是 chart_id
+    if stage in ("slide", "stage2_star"):
+        stem = stem.rsplit("_", 1)[0]
+    return stem
+
+
+def _strip_lv_suffix(stem: str) -> str:
+    """去掉 _lv{N} 后缀，返回原始 song_id。"""
+    import re
+    m = re.search(r'^(.*)_lv(\d+)$', stem)
+    return m.group(1) if m else stem
 
 
 def _get_level_from_cache(fp: Path) -> float:
@@ -206,16 +264,16 @@ def _get_level_from_cache(fp: Path) -> float:
 
 
 def build_song_level_map(cache_root: str | Path) -> dict[str, float]:
-    """扫描 stage1 缓存，建立 song_id → level 映射。"""
+    """扫描 stage1 缓存，建立 chart_id → level 映射。"""
     cache_root = Path(cache_root)
     s1_dir = cache_root / "stage1"
     if not s1_dir.exists():
         return {}
 
     level_map: dict[str, float] = {}
-    for fp in sorted(s1_dir.glob("*.pt")):
-        song_id = _extract_song_id(fp, "stage1")
-        level_map[song_id] = _get_level_from_cache(fp)
+    for fp in sorted(s1_dir.glob("*_lv*.pt")):
+        chart_id = _extract_chart_id(fp, "stage1")
+        level_map[chart_id] = _get_level_from_cache(fp)
     return level_map
 
 
@@ -227,14 +285,10 @@ def make_train_val_split(
     split_file: str | Path | None = None,
 ) -> tuple[set[str], set[str]]:
     """
-    根据难度等级和比例划分训练集 / 验证集。
-
-    规则:
-      1. 从 level < val_level_threshold 的歌中随机抽取 val_ratio 比例作为验证集。
-      2. 如果提供了 split_file (JSON)，则直接从文件读取划分。
+    根据难度等级和比例划分训练集 / 验证集（chart 级别）。
 
     Returns:
-        (train_ids, val_ids)  两个 song_id 集合。
+        (train_ids, val_ids)  两个 chart_id 集合 ({song_id}_lv{N})。
     """
     cache_root = Path(cache_root)
 
@@ -243,8 +297,8 @@ def make_train_val_split(
         split_path = Path(split_file)
         if split_path.exists():
             data = json.loads(split_path.read_text(encoding="utf-8"))
-            train_ids = {s["song_id"] for s in data.get("train_songs", [])}
-            val_ids = {s["song_id"] for s in data.get("val_songs", [])}
+            train_ids = {s.get("chart_id", s.get("song_id")) for s in data.get("train_songs", [])}
+            val_ids = {s.get("chart_id", s.get("song_id")) for s in data.get("val_songs", [])}
             logger.info(
                 "从 %s 加载划分: train=%d, val=%d",
                 split_path, len(train_ids), len(val_ids),
@@ -252,15 +306,14 @@ def make_train_val_split(
             return train_ids, val_ids
         logger.warning("split_file 不存在: %s，将自动划分", split_path)
 
-    # 自动划分
+    # 自动划分（chart 级别）
     level_map = build_song_level_map(cache_root)
     if not level_map:
         logger.warning("stage1 缓存为空，无法划分 train/val")
         return set(), set()
 
-    # 低难度候选
-    low_level = [sid for sid, lv in level_map.items() if lv < val_level_threshold]
-    high_level = [sid for sid, lv in level_map.items() if lv >= val_level_threshold]
+    low_level = [cid for cid, lv in level_map.items() if lv < val_level_threshold]
+    high_level = [cid for cid, lv in level_map.items() if lv >= val_level_threshold]
 
     rng = random.Random(seed)
     rng.shuffle(low_level)
@@ -270,7 +323,7 @@ def make_train_val_split(
     train_ids = set(low_level[val_count:]) | set(high_level)
 
     logger.info(
-        "自动划分: train=%d (≥Lv%.0f=%d), val=%d (全 < Lv%.0f) (val_ratio=%.0f%%)",
+        "自动划分: train=%d charts (≥Lv%.0f=%d), val=%d charts (全 < Lv%.0f) (val_ratio=%.0f%%)",
         len(train_ids), val_level_threshold, len(high_level),
         len(val_ids), val_level_threshold, val_ratio * 100,
     )
@@ -295,13 +348,14 @@ class SplitStageDataset(Dataset):
         stage_root = self.root / stage
         all_items = sorted(stage_root.glob("*.pt")) if stage_root.exists() else []
 
-        # 按 song_id 过滤
+        # 按 chart_id 过滤
         self.items = [
             fp for fp in all_items
-            if _extract_song_id(fp, stage) in song_ids
+            if _extract_chart_id(fp, stage) in song_ids
         ]
 
         self._slide_audio_cache: dict[str, torch.Tensor] = {}
+        self.items = self._filter_supervised(self.items)
 
         if max_tokens is not None or max_onset is not None:
             self.items = self._filter_by_length(self.items, max_tokens, max_onset)
@@ -310,6 +364,12 @@ class SplitStageDataset(Dataset):
             "SplitStageDataset[%s]: %d samples (from %d songs)",
             stage, len(self.items), len(song_ids),
         )
+
+    def _has_supervision(self, data: dict[str, Any]) -> bool:
+        return StageCacheDataset._has_supervision(self, data)
+
+    def _filter_supervised(self, items: list[Path]) -> list[Path]:
+        return StageCacheDataset._filter_supervised(self, items)
 
     def _filter_by_length(
         self,
@@ -347,23 +407,25 @@ class SplitStageDataset(Dataset):
 
     def __getitem__(self, idx: int) -> dict[str, Any]:
         data = torch.load(self.items[idx], map_location="cpu", weights_only=True)
-        if self.stage == "slide":
-            song_id = _extract_song_id(self.items[idx], self.stage)
+        if self.stage in {"slide", "stage2_star"}:
+            chart_id = _extract_chart_id(self.items[idx], self.stage)
+            song_id = _strip_lv_suffix(chart_id)
             audio_memory = self._slide_audio_cache.get(song_id)
             if audio_memory is None:
-                hidden_path = self.root / "_hidden" / f"{song_id}.pt"
-                if hidden_path.exists():
-                    hidden = torch.load(hidden_path, map_location="cpu", weights_only=True)
+                found = list((self.root / "_hidden").glob(f"{song_id}_lv*.pt"))
+                if found:
+                    hidden = torch.load(found[0], map_location="cpu", weights_only=True)
                     audio_memory = hidden.get("audio_memory")
-                    if torch.is_tensor(audio_memory):
-                        # ── NaN 检查 ──
-                        if torch.isnan(audio_memory).any():
-                            logger.warning(
-                                "SplitStageDataset[slide] audio_memory 含 NaN: _hidden/%s.pt，已替换",
-                                song_id,
-                            )
-                            audio_memory = torch.nan_to_num(audio_memory, nan=0.0)
-                        self._slide_audio_cache[song_id] = audio_memory
+                elif (self.root / "_hidden" / f"{song_id}.pt").exists():
+                    hidden = torch.load(self.root / "_hidden" / f"{song_id}.pt", map_location="cpu", weights_only=True)
+                    audio_memory = hidden.get("audio_memory")
+                if torch.is_tensor(audio_memory):
+                    if torch.isnan(audio_memory).any():
+                        logger.warning(
+                            "SplitStageDataset[slide] audio_memory 含 NaN: _hidden/%s，已替换", song_id,
+                        )
+                        audio_memory = torch.nan_to_num(audio_memory, nan=0.0)
+                    self._slide_audio_cache[song_id] = audio_memory
             if torch.is_tensor(audio_memory):
                 data["audio_memory"] = audio_memory
         data["_file"] = str(self.items[idx])

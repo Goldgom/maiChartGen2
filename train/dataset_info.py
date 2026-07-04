@@ -57,7 +57,10 @@ def _analyze_stage1(cache_root: Path) -> dict[str, Any]:
     if not s1_dir.exists():
         return {"count": 0, "error": "stage1 cache not found"}
 
-    files = sorted(s1_dir.glob("*.pt"))
+    files = sorted(s1_dir.glob("*_lv*.pt"))
+    # fallback: 旧格式无 _lv 后缀
+    if not files:
+        files = sorted(s1_dir.glob("*.pt"))
     if not files:
         return {"count": 0, "error": "no stage1 cache files"}
 
@@ -70,6 +73,7 @@ def _analyze_stage1(cache_root: Path) -> dict[str, Any]:
     truncated: int = 0
     max_tok = 0
     errors: list[str] = []
+    songs: set[str] = set()
 
     for fp in files:
         try:
@@ -77,6 +81,12 @@ def _analyze_stage1(cache_root: Path) -> dict[str, Any]:
         except Exception as e:
             errors.append(f"{fp.name}: {e}")
             continue
+
+        # 提取 song_id 用于统计
+        stem = fp.stem
+        import re
+        m = re.search(r'^(.*)_lv\d+$', stem)
+        songs.add(m.group(1) if m else stem)
 
         bpms.append(float(d["bpm"].item()))
         levels.append(float(d["level"].item()))
@@ -93,16 +103,16 @@ def _analyze_stage1(cache_root: Path) -> dict[str, Any]:
         ol = int(d["onset"].size(0))
         onset_lens.append(ol)
 
-    # 截断检测：如果多个样本 token 数完全一致且较大，很可能是被截断了
+    # 截断检测
     if tok_lens:
         len_counter = Counter(tok_lens)
-        # 如果最常见长度在 top-2 且占比 > 5%，标记为潜在截断点
         for length, cnt in len_counter.most_common(3):
             if cnt >= max(3, len(tok_lens) * 0.03):
                 truncated += cnt
 
     return {
         "count": len(files),
+        "songs": len(songs),
         "errors": len(errors),
         "bpm": {
             "min": min(bpms) if bpms else 0,
@@ -181,7 +191,7 @@ def print_dataset_info(cache_root: str | Path, prefix: str = "") -> dict[str, An
     logger.info(sep)
 
     # Stage 1
-    logger.info(f"  Stage 1 歌曲数: {s1['count']}")
+    logger.info(f"  Stage 1: {s1['count']} charts (来自 {s1.get('songs', 0)} 首歌曲)")
     if s1.get("errors"):
         logger.warning(f"    加载错误: {s1['errors']} 首")
 
@@ -225,7 +235,7 @@ def print_dataset_info(cache_root: str | Path, prefix: str = "") -> dict[str, An
     for stage in ["touch", "break", "spike", "slide"]:
         c = info[stage]["count"]
         tag = "✅" if c > 0 else "⚠ (需先运行 build_stage234_cache)"
-        logger.info(f"  Stage {stage.capitalize()}: {c} 首  {tag}")
+        logger.info(f"  Stage {stage.capitalize()}: {c} charts  {tag}")
 
     # ── 直方图 ──
     data = s1.get("data", {})

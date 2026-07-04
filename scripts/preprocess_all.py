@@ -54,12 +54,11 @@ def run_step(script: str, description: str, args: argparse.Namespace) -> bool:
             cmd.extend(["--num-workers", str(args.num_workers)])
         if args.data_root:
             cmd.extend(["--data-root", args.data_root])
-
-    if args.limit:
-        cmd.extend(["--limit", str(args.limit)])
-    # 默认跳过已有缓存，--force 强制重跑
-    if args.force:
-        cmd.append("--force")
+        if args.limit:
+            cmd.extend(["--limit", str(args.limit)])
+        # 默认跳过已有缓存，--force 强制重跑
+        if args.force:
+            cmd.append("--force")
 
     # audio 专用
     if "audio" in script:
@@ -73,6 +72,8 @@ def run_step(script: str, description: str, args: argparse.Namespace) -> bool:
     if "labels" in script:
         if args.subdiv:
             cmd.extend(["--subdiv", str(args.subdiv)])
+        if args.maxsubdiv:
+            cmd.extend(["--maxsubdiv", str(args.maxsubdiv)])
         if args.max_tokens:
             cmd.extend(["--max-tokens", str(args.max_tokens)])
         cmd.extend(["--cache-root", str(args.cache_root)])
@@ -83,8 +84,6 @@ def run_step(script: str, description: str, args: argparse.Namespace) -> bool:
         cmd.extend(["--config", "configs/rotating_4090.yaml"])
         if args.limit:
             cmd.extend(["--limit", str(args.limit)])
-        if args.force:
-            cmd.append("--force")
 
     logger.info(f"  命令: {' '.join(cmd)}")
     result = subprocess.run(cmd, cwd=_PROJECT_ROOT)
@@ -107,6 +106,7 @@ def main():
     p.add_argument("--num-workers", type=int, default=1, help="并行线程数")
     p.add_argument("--subdiv", type=int, default=64)
     p.add_argument("--max-tokens", type=int, default=16384)
+    p.add_argument("--maxsubdiv", type=int, default=64, help="谱面归一化网格精度")
     p.add_argument("--force", action="store_true", help="强制重新处理")
     p.add_argument("--encodec-layers", type=int, default=1, help="EnCodec 层数 (1/2)")
     args = p.parse_args()

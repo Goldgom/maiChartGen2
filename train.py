@@ -14,9 +14,10 @@ import torch
 from train.data import StageCacheDataset, SplitStageDataset, build_loader, make_train_val_split
 from train.metrics import VAL_FN_MAP
 from train.optim import build_optimizer, build_scheduler
-from train.recipes import break_step, slide_step, spike_step, stage1_step, touch_step
+from train.recipes import break_step, slide_step, spike_step, stage1_step, touch_step, hold_step, touch_hold_step, star_step, touch_pattern_step
 from train.trainer import RotatingMultiStageTrainer, StageRuntime
-from models import MaiGenerator, TouchRefiner, SlidePathGenerator, BreakClassifier, SpikeClassifier
+from models import MaiGenerator, TouchRefiner, SlidePathGenerator, BreakClassifier, SpikeClassifier, HoldDurationPredictor, TouchHoldDurationPredictor, TouchPatternRefiner
+from models.slide_stage import SlideStarRefiner
 
 
 def _load_config(path: str | Path) -> dict[str, Any]:
@@ -77,6 +78,14 @@ def _load_yaml_subset(text: str) -> dict[str, Any]:
 
 
 def _build_model(stage: str, cfg: dict[str, Any]):
+    if stage == "stage2_star":
+        return SlidePathGenerator(**dict(cfg["models"].get("slide", {})))
+    if stage == "stage5_touch":
+        return TouchPatternRefiner(**dict(cfg["models"].get("stage5_touch", cfg["models"].get("touch", {}))))
+    if stage == "stage6_break_note":
+        return BreakClassifier(**dict(cfg["models"].get("break", {})))
+    if stage == "stage7_firework_note":
+        return SpikeClassifier(**dict(cfg["models"].get("spike", {})))
     mcfg = dict(cfg["models"][stage])  # copy
     if stage == "stage1":
         ec = cfg.get("audio_encodec", {})
@@ -99,6 +108,12 @@ def _build_model(stage: str, cfg: dict[str, Any]):
         return BreakClassifier(**mcfg)
     if stage == "spike":
         return SpikeClassifier(**mcfg)
+    if stage == "hold":
+        return HoldDurationPredictor(**mcfg)
+    if stage == "touch_hold":
+        return TouchHoldDurationPredictor(**mcfg)
+    if stage == "star":
+        return SlideStarRefiner(**mcfg)
     raise ValueError(stage)
 
 
@@ -128,26 +143,28 @@ def _build_stage(
     sched_cfg = _stage_cfg(cfg, "sched", stage)
 
     cache_dir = Path(data_cfg["cache_root"])
+    # star stage 复用 slide 缓存（同数据源，精炼任务）
+    cache_stage = {"star": "slide"}.get(stage, stage)
     max_tokens = data_cfg.get(f"max_{stage}_tokens", data_cfg.get("max_tokens"))
     max_onset = data_cfg.get(f"max_{stage}_onset", data_cfg.get("max_onset"))
 
-    # ── 构建训练集（按 song_id 划分）──
+    # ── 构建训练集 ──
     if train_ids is not None:
         train_dataset = SplitStageDataset(
-            cache_dir, stage, train_ids,
+            cache_dir, cache_stage, train_ids,
             max_tokens=int(max_tokens) if max_tokens is not None else None,
             max_onset=int(max_onset) if max_onset is not None else None,
         )
     else:
         train_dataset = StageCacheDataset(
-            cache_dir, stage,
+            cache_dir, cache_stage,
             max_tokens=int(max_tokens) if max_tokens is not None else None,
             max_onset=int(max_onset) if max_onset is not None else None,
         )
 
     if len(train_dataset) == 0:
         raise FileNotFoundError(
-            f"Stage '{stage}': cache/{stage}/ 目录为空或划分后无训练数据。请先运行预处理:\n"
+            f"Stage '{stage}': cache/{cache_stage}/ 目录为空或划分后无训练数据。请先运行预处理:\n"
             f"  python scripts/preprocess_all.py"
         )
 
@@ -162,7 +179,7 @@ def _build_stage(
     val_loader = None
     if val_ids is not None and len(val_ids) > 0:
         val_dataset = SplitStageDataset(
-            cache_dir, stage, val_ids,
+            cache_dir, cache_stage, val_ids,
             max_tokens=int(max_tokens) if max_tokens is not None else None,
             max_onset=int(max_onset) if max_onset is not None else None,
         )
@@ -187,10 +204,17 @@ def _build_stage(
     scheduler = build_scheduler(optimizer, sched_cfg, total_steps=1)
     step_map = {
         "stage1": stage1_step,
+        "stage2_star": slide_step,
         "touch": touch_step,
+        "stage5_touch": touch_pattern_step,
         "slide": slide_step,
         "break": break_step,
+        "stage6_break_note": break_step,
         "spike": spike_step,
+        "stage7_firework_note": spike_step,
+        "hold": hold_step,
+        "touch_hold": touch_hold_step,
+        "star": star_step,
     }
     return StageRuntime(
         name=stage,
@@ -215,7 +239,7 @@ def main():
                         help="最大训练 epoch 数（每 epoch = 全量数据过一遍）")
     parser.add_argument("--resume", default=None)
     parser.add_argument("--train-stage", default=None,
-                        choices=["stage1", "touch", "slide", "break", "spike"],
+                        choices=["stage1", "stage2_star", "touch", "slide", "hold", "touch_hold", "stage5_touch", "star", "break", "stage6_break_note", "spike", "stage7_firework_note"],
                         help="只训练指定 stage (不分阶段训练请省略)")
     parser.add_argument("--no-val", action="store_true",
                         help="禁用验证集划分，全部数据用于训练")
@@ -251,11 +275,11 @@ def main():
         )
         import logging
         logging.info(
-            "Train/Val 划分: train=%d songs, val=%d songs (max_val_level=%.0f, val_ratio=%.0f%%)",
+            "Train/Val 划分: train=%d charts, val=%d charts (max_val_level=%.0f, val_ratio=%.0f%%)",
             len(train_ids), len(val_ids), val_level_threshold, val_ratio * 100,
         )
 
-    all_stage_names = ["stage1", "touch", "slide", "break", "spike"]
+    all_stage_names = ["stage1", "stage2_star", "hold", "touch_hold", "stage5_touch", "stage6_break_note", "stage7_firework_note"]
     if args.train_stage:
         stage_names = [args.train_stage]
         import logging

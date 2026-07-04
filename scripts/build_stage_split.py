@@ -18,6 +18,8 @@ def _song_payload(song) -> dict[str, Any]:
     charts = []
     for idx, chart in sorted(song.charts.items()):
         charts.append({
+            "chart_id": f"{song.song_id}_lv{idx}",
+            "song_id": song.song_id,
             "difficulty_index": idx,
             "level": _chart_level(chart),
             "note_count": int(getattr(chart, "note_count", 0) or 0),

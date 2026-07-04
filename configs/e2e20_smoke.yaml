@@ -1,0 +1,125 @@
+seed: 42
+device: cuda
+precision: amp
+use_bf16: false
+compile: false
+
+data:
+  cache_root: cache/e2e20
+  num_workers: 0
+  maxsubdiv: 64
+  max_tokens: 4096
+
+audio_encodec:
+  n_layers: 1
+  sample_rate: 24000
+  bandwidth: 6.0
+
+audio_multiscale:
+  global_stride: 8
+  local_window_s: 5.0
+  local_slots_per_sec: 184
+  local_dilation_base: 4
+  max_spectral_len: 4096
+  use_spectral_sliding_window: true
+  spectral_window_len: 1024
+  spectral_window_stride: 512
+
+train:
+  batch_size: 1
+  max_turns: 1
+  log_every: 1
+  eval_every_turns: 0
+  save_every_turns: 0
+  clip_grad_norm: 0.8
+  offload_to_cpu: false
+  grad_accum_steps: 1
+  turn_batches: 1
+  max_epochs: 0
+  stages:
+    stage1: {turn_batches: 1, grad_accum_steps: 1}
+    stage2_star: {turn_batches: 1, grad_accum_steps: 1}
+    hold: {turn_batches: 1, grad_accum_steps: 1}
+    touch_hold: {turn_batches: 1, grad_accum_steps: 1}
+    stage5_touch: {turn_batches: 1, grad_accum_steps: 1}
+    stage6_break_note: {turn_batches: 1, grad_accum_steps: 1}
+    stage7_firework_note: {turn_batches: 1, grad_accum_steps: 1}
+
+optim:
+  name: adamw
+  lr: 0.0005
+  weight_decay: 0.01
+  betas: [0.9, 0.95]
+
+sched:
+  name: constant
+  warmup_steps: 0
+  min_lr: 0.00001
+
+checkpoint:
+  dir: runs/e2e20_smoke
+  keep_last: 1
+  best_metric: loss
+  best_mode: min
+
+val:
+  max_val_level: 14.0
+  val_ratio: 0.0
+  seed: 42
+
+models:
+  stage1:
+    hidden_dim: 64
+    num_layers: 2
+    num_heads: 4
+    audio_stream_layers: 1
+    audio_stream_heads: 4
+    use_checkpoint: false
+    audio_vocab_size: 1027
+    use_sliding_window: true
+    window_tokens: 1024
+    window_stride: 512
+    max_summary_tokens: 4
+    summary_position: prefix
+    detach_summary: true
+    audio_window_tokens: 1024
+    audio_global_summary_tokens: 4
+  touch:
+    hidden_dim: 64
+    num_layers: 2
+    num_heads: 4
+  stage5_touch:
+    hidden_dim: 64
+    num_layers: 2
+    num_heads: 4
+    stage1_dim: 64
+  slide:
+    hidden_dim: 64
+    num_layers: 2
+    num_heads: 4
+    stage1_dim: 64
+  break:
+    hidden_dim: 64
+    num_layers: 2
+    num_heads: 4
+    stage1_dim: 64
+  spike:
+    hidden_dim: 64
+    num_layers: 2
+    num_heads: 4
+    stage1_dim: 64
+  hold:
+    hidden_dim: 64
+    num_layers: 2
+    num_heads: 4
+    stage1_dim: 64
+  touch_hold:
+    hidden_dim: 64
+    num_layers: 2
+    num_heads: 4
+    stage1_dim: 64
+  star:
+    hidden_dim: 64
+    num_layers: 2
+    num_heads: 4
+    stage1_dim: 64

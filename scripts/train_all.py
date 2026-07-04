@@ -26,6 +26,16 @@ PYTHON = sys.executable
 CONFIG = "configs/rotating_4090.yaml"
 
 
+def load_config(path: str | Path) -> dict[str, Any]:
+    from typing import Any
+    try:
+        import yaml
+        with open(path) as f:
+            return yaml.safe_load(f) or {}
+    except Exception:
+        return {}
+
+
 def stage_checkpoint(checkpoint_dir: str, stage: str, kind: str = "best") -> Path:
     stage_dir_path = Path(checkpoint_dir) / stage / f"{kind}.pt"
     if stage_dir_path.exists():
@@ -80,9 +90,12 @@ def main():
     # Phase 1: 预处理
     # ═══════════════════════════════════════════════════════════════
     if args.do_preprocess:
+        cfg = load_config(args.config)
+        maxsubdiv = int((cfg.get("data", {}) or {}).get("maxsubdiv", 64))
         if not run(
             [PYTHON, "scripts/preprocess_all.py",
              "--num-workers", str(args.num_workers),
+             "--maxsubdiv", str(maxsubdiv),
              "--cache-root", args.cache_root],
             "Phase 1: 预处理"
         ):
@@ -95,73 +108,44 @@ def main():
         logger.info(f"缓存就绪 ({len(list(cache_audio.glob('*.pt')))} 首)")
 
     # ═══════════════════════════════════════════════════════════════
-    # Phase 2: 训练 Stage 1
+    # Phase 2: 训练 Stage 1 (maiG)
     # ═══════════════════════════════════════════════════════════════
     if not run(
         [PYTHON, "train.py", "--config", args.config,
-         "--train-stage", "stage1",
-         "--max-turns", str(args.stage1_turns)],
-        f"Phase 2: 训练 Stage 1 ({args.stage1_turns} turns)"
+         "--train-stage", "stage1", "--max-epochs", "1"],
+        f"Phase 2: 训练 Stage 1 - maiG"
     ):
         sys.exit(1)
 
     # ═══════════════════════════════════════════════════════════════
-    # Phase 3: 导出 Hidden + 构建 Touch/Break/Spike 缓存
+    # Phase 3: 导出 Hidden + 构建缓存
     # ═══════════════════════════════════════════════════════════════
     checkpoint = str(stage_checkpoint(args.checkpoint_dir, "stage1", "best"))
     if not run(
         [PYTHON, "scripts/build_stage234_cache.py",
-         "--step", "all",
-         "--checkpoint", checkpoint,
-         "--config", args.config,
-         "--cache-root", args.cache_root],
-        f"Phase 3: 导出 Hidden + 构建 Touch/Break/Spike/Slide 缓存"
+         "--step", "all", "--checkpoint", checkpoint,
+         "--config", args.config, "--cache-root", args.cache_root],
+        f"Phase 3: 导出 Hidden + 构建缓存"
     ):
         sys.exit(1)
 
     # ═══════════════════════════════════════════════════════════════
-    # Phase 4: 训练 Stage 2 (Touch)
+    # Phase 4-10: 训练 Stage 2-7
     # ═══════════════════════════════════════════════════════════════
-    if not run(
-        [PYTHON, "train.py", "--config", args.config,
-         "--train-stage", "touch",
-         "--max-turns", str(args.stage2_turns)] + resume_args(args.checkpoint_dir, "touch"),
-        f"Phase 4: 训练 Stage 2 - Touch ({args.stage2_turns} turns)"
-    ):
-        sys.exit(1)
-
-    # ═══════════════════════════════════════════════════════════════
-    # Phase 5: 训练 Stage 2.5 (Slide)
-    # ═══════════════════════════════════════════════════════════════
-    if not run(
-        [PYTHON, "train.py", "--config", args.config,
-         "--train-stage", "slide",
-         "--max-turns", str(args.stage25_turns)] + resume_args(args.checkpoint_dir, "slide"),
-        f"Phase 5: 训练 Stage 2.5 - Slide ({args.stage25_turns} turns)"
-    ):
-        sys.exit(1)
-
-    # ═══════════════════════════════════════════════════════════════
-    # Phase 6: 训练 Stage 3 (Break)
-    # ═══════════════════════════════════════════════════════════════
-    if not run(
-        [PYTHON, "train.py", "--config", args.config,
-         "--train-stage", "break",
-         "--max-turns", str(args.stage3_turns)] + resume_args(args.checkpoint_dir, "break"),
-        f"Phase 6: 训练 Stage 3 - Break ({args.stage3_turns} turns)"
-    ):
-        sys.exit(1)
-
-    # ═══════════════════════════════════════════════════════════════
-    # Phase 7: 训练 Stage 4 (Spike)
-    # ═══════════════════════════════════════════════════════════════
-    if not run(
-        [PYTHON, "train.py", "--config", args.config,
-         "--train-stage", "spike",
-         "--max-turns", str(args.stage4_turns)] + resume_args(args.checkpoint_dir, "spike"),
-        f"Phase 7: 训练 Stage 4 - Spike ({args.stage4_turns} turns)"
-    ):
-        sys.exit(1)
+    for stage, phase_name in [
+        ("slide",      "Stage2 Slide星星"),
+        ("hold",       "Stage3 Hold时长"),
+        ("touch_hold", "Stage4 TouchHold"),
+        ("star",       "Stage5 星星精炼"),
+        ("break",      "Stage6 Break绝赞"),
+        ("spike",      "Stage7 Spike烟花"),
+    ]:
+        if not run(
+            [PYTHON, "train.py", "--config", args.config,
+             "--train-stage", stage, "--max-epochs", "1"] + resume_args(args.checkpoint_dir, stage),
+            f"Phase - {phase_name}"
+        ):
+            sys.exit(1)
 
     total = time.time() - t_total
     logger.info("=" * 60)

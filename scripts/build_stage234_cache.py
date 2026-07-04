@@ -120,7 +120,7 @@ def run_export_hidden(args):
     # Load config
     if args.config:
         import yaml
-        with open(args.config) as f:
+        with open(args.config, encoding='utf-8') as f:
             cfg = yaml.safe_load(f)
     else:
         cfg = {}
@@ -231,7 +231,103 @@ def build_stage_cache(
     }, spike_dir / f"{name}.pt")
     ok += 1
 
+    # ── Hold cache (Stage 3) ──
+    hold_dir = cache_root / "hold"
+    hold_dir.mkdir(parents=True, exist_ok=True)
+    hold_mask = torch.zeros(T, dtype=torch.bool)
+    dur_num_targets = torch.zeros(T, dtype=torch.long)
+    dur_den_targets = torch.zeros(T, dtype=torch.long)
+    _compute_hold_targets_from_labels(labels, T, hold_mask, dur_num_targets, dur_den_targets)
+    torch.save({
+        "tokens": labels["stage1_tokens"][:T],
+        "stage1_hidden": stage1_hidden[:T],
+        "hold_mask": hold_mask,
+        "dur_num_targets": dur_num_targets,
+        "dur_den_targets": dur_den_targets,
+    }, hold_dir / f"{name}.pt")
+    ok += 1
+
+    # ── Touch Hold cache (Stage 4) ──
+    thold_dir = cache_root / "touch_hold"
+    thold_dir.mkdir(parents=True, exist_ok=True)
+    thold_mask = torch.zeros(T, dtype=torch.bool)
+    thold_num = torch.zeros(T, dtype=torch.long)
+    thold_den = torch.zeros(T, dtype=torch.long)
+    _compute_touch_hold_targets_from_labels(labels, T, thold_mask, thold_num, thold_den)
+    torch.save({
+        "tokens": labels["stage1_tokens"][:T],
+        "stage1_hidden": stage1_hidden[:T],
+        "touch_hold_mask": thold_mask,
+        "dur_num_targets": thold_num,
+        "dur_den_targets": thold_den,
+    }, thold_dir / f"{name}.pt")
+    ok += 1
+
     return ok
+
+
+def _compute_hold_targets_from_labels(labels, T, hold_mask, num_t, den_t):
+    """从 labels 计算 hold duration 训练目标。"""
+    from Tokenizer.config_vocab import ID_TO_CONFIG, BTN_HOLD_START
+    tokens = labels["stage1_tokens"][:T].tolist()
+    i = 0
+    while i < T:
+        tid = tokens[i]
+        sc = ID_TO_CONFIG.get(tid)
+        if sc is not None:
+            has_hold_start = any(s == BTN_HOLD_START for _, s in sc.buttons)
+            if has_hold_start:
+                hold_mask[i] = True
+                # 查找 hold 持续 slot 数
+                j = i + 1
+                while j < T:
+                    sc2 = ID_TO_CONFIG.get(tokens[j])
+                    if sc2 is None:
+                        break
+                    has_hold = any(s in (BTN_HOLD_START, 2) for _, s in sc2.buttons)  # 2 = HOLD_ONGOING
+                    if not has_hold:
+                        break
+                    j += 1
+                dur_slots = j - i
+                dur_beats = dur_slots / 64  # maxsubdiv
+                num_idx = min(range(8), key=lambda k: abs([1,2,3,4,6,8,12,16][k] - max(1, round(dur_beats * 64))))
+                den_idx = 0  # den=64
+                num_t[i] = num_idx
+                den_t[i] = den_idx
+                i = j
+            else:
+                i += 1
+        else:
+            i += 1
+
+
+def _compute_touch_hold_targets_from_labels(labels, T, hold_mask, num_t, den_t):
+    """从 labels 计算 touch hold duration 训练目标。"""
+    from Tokenizer.config_vocab import ID_TO_CONFIG, TCH_HOLD_START
+    tokens = labels["stage1_tokens"][:T].tolist()
+    i = 0
+    while i < T:
+        tid = tokens[i]
+        sc = ID_TO_CONFIG.get(tid)
+        if sc is not None:
+            has_th_start = any(s == TCH_HOLD_START for _, s in sc.touches)
+            if has_th_start:
+                hold_mask[i] = True
+                j = i + 1
+                while j < T:
+                    sc2 = ID_TO_CONFIG.get(tokens[j])
+                    if sc2 is None or not sc2.touches:
+                        break
+                    j += 1
+                dur_slots = j - i
+                num_idx = min(range(8), key=lambda k: abs([1,2,3,4,6,8,12,16][k] - max(1, round(dur_slots / 64 * 64))))
+                num_t[i] = num_idx
+                den_t[i] = 0
+                i = j
+            else:
+                i += 1
+        else:
+            i += 1
 
 
 def _safe_save(data: Any, path: Path) -> None:
@@ -243,8 +339,8 @@ def _safe_save(data: Any, path: Path) -> None:
 
 def _inject_slide_audio(label_files, hidden_files, cache_root, args):
     """将 Stage 1 的 audio_memory 注入到 slide 缓存文件中。"""
-    slide_dir = cache_root / "slide"
-    slide_files = sorted(slide_dir.glob("*.pt"))
+    slide_files = sorted((cache_root / "slide").glob("*.pt"))
+    slide_files += sorted((cache_root / "stage2_star").glob("*.pt"))
     if not slide_files:
         return
     logger.info(f"注入 audio_memory 到 {len(slide_files)} 个 slide 文件...")
@@ -273,8 +369,8 @@ def _inject_slide_audio(label_files, hidden_files, cache_root, args):
 
 def _strip_slide_audio(cache_root: Path) -> None:
     """一次性清理旧流程写入 slide 样本的重复 audio_memory。"""
-    slide_dir = cache_root / "slide"
-    slide_files = sorted(slide_dir.glob("*.pt"))
+    slide_files = sorted((cache_root / "slide").glob("*.pt"))
+    slide_files += sorted((cache_root / "stage2_star").glob("*.pt"))
     if not slide_files:
         return
     logger.info(f"清理 slide 文件中的重复 audio_memory: {len(slide_files)} 个文件...")
@@ -293,6 +389,116 @@ def _strip_slide_audio(cache_root: Path) -> None:
     logger.info(f"已清理 {updated} 个 slide 文件")
 
 
+def _build_event_stage_caches(cache_root: Path, cfg: dict | None = None) -> int:
+    """Build new-stage placeholder caches from _labels event annotations."""
+    labels_dir = cache_root / "_labels"
+    label_files = sorted(labels_dir.glob("*.pt"))
+    if not label_files:
+        return 0
+
+    stage1_dim = int((cfg or {}).get("models", {}).get("stage1", {}).get("hidden_dim", 768))
+    audio_memory = torch.zeros(64, stage1_dim)
+    ok = 0
+
+    for lp in label_files:
+        name = lp.stem
+        labels = torch.load(lp, map_location="cpu", weights_only=True)
+        tokens = labels["stage1_tokens"]
+        T = int(tokens.size(0))
+        stage1_hidden = torch.zeros(T, stage1_dim)
+
+        hold_num = torch.zeros(T, dtype=torch.long)
+        hold_den = torch.zeros(T, dtype=torch.long)
+        hold_mask = torch.zeros(T, dtype=torch.bool)
+        for ev in labels.get("stage3_hold_events", []):
+            slot = int(ev.get("slot", -1)) + 1
+            if 0 <= slot < T:
+                hold_mask[slot] = True
+                hold_num[slot] = int(ev.get("dur_num_target", 0))
+                hold_den[slot] = int(ev.get("dur_den_target", 0))
+        (cache_root / "hold").mkdir(parents=True, exist_ok=True)
+        torch.save({
+            "tokens": tokens,
+            "stage1_hidden": stage1_hidden,
+            "audio_memory": audio_memory,
+            "dur_num_targets": hold_num,
+            "dur_den_targets": hold_den,
+            "hold_mask": hold_mask,
+        }, cache_root / "hold" / f"{name}.pt")
+        ok += 1
+
+        th_num = torch.zeros(T, dtype=torch.long)
+        th_den = torch.zeros(T, dtype=torch.long)
+        th_mask = torch.zeros(T, dtype=torch.bool)
+        for ev in labels.get("stage4_touch_hold_events", []):
+            slot = int(ev.get("slot", -1)) + 1
+            if 0 <= slot < T:
+                th_mask[slot] = True
+                th_num[slot] = int(ev.get("dur_num_target", 0))
+                th_den[slot] = int(ev.get("dur_den_target", 0))
+        (cache_root / "touch_hold").mkdir(parents=True, exist_ok=True)
+        torch.save({
+            "tokens": tokens,
+            "stage1_hidden": stage1_hidden,
+            "audio_memory": audio_memory,
+            "dur_num_targets": th_num,
+            "dur_den_targets": th_den,
+            "touch_hold_mask": th_mask,
+        }, cache_root / "touch_hold" / f"{name}.pt")
+        ok += 1
+
+        from Tokenizer.touch_pattern_vocab import TOUCH_PATTERN_NUM_ZONES, encode_zones
+        pattern_targets = torch.zeros(T, TOUCH_PATTERN_NUM_ZONES, dtype=torch.float32)
+        pattern_tokens = torch.zeros(T, dtype=torch.long)
+        pattern_mask = torch.zeros(T, dtype=torch.bool)
+        for ev in labels.get("stage5_touch_events", []):
+            slot = int(ev.get("slot", -1)) + 1
+            zones = ev.get("zones", [])
+            if torch.is_tensor(zones):
+                zones = zones.reshape(-1).tolist()
+            zones = [int(z) for z in zones]
+            if 0 <= slot < T and zones:
+                pattern_mask[slot] = True
+                pattern_tokens[slot] = int(encode_zones(zones))
+                for z in zones:
+                    if 0 <= z < TOUCH_PATTERN_NUM_ZONES:
+                        pattern_targets[slot, z] = 1.0
+
+        (cache_root / "stage5_touch").mkdir(parents=True, exist_ok=True)
+        torch.save({
+            "tokens": tokens,
+            "stage1_hidden": stage1_hidden,
+            "audio_memory": audio_memory,
+            "touch_pattern_targets": pattern_targets,
+            "touch_pattern_tokens": pattern_tokens,
+            "touch_pattern_mask": pattern_mask,
+            "touch_events": labels.get("stage5_touch_events", []),
+        }, cache_root / "stage5_touch" / f"{name}.pt")
+        ok += 1
+
+        (cache_root / "stage6_break_note").mkdir(parents=True, exist_ok=True)
+        torch.save({
+            "tokens": tokens,
+            "stage1_hidden": stage1_hidden,
+            "targets": labels["break_targets"],
+            "press_mask": labels["press_mask"],
+            "note_events": labels.get("stage6_break_note_events", []),
+        }, cache_root / "stage6_break_note" / f"{name}.pt")
+        ok += 1
+
+        (cache_root / "stage7_firework_note").mkdir(parents=True, exist_ok=True)
+        torch.save({
+            "tokens": tokens,
+            "stage1_hidden": stage1_hidden,
+            "targets": labels["spike_targets"],
+            "touch_mask": labels["touch_mask"],
+            "note_events": labels.get("stage7_firework_note_events", []),
+        }, cache_root / "stage7_firework_note" / f"{name}.pt")
+        ok += 1
+
+    return ok
+
+
 def run_build_caches(args):
     cache_root = Path(args.cache_root)
     labels_dir = cache_root / "_labels"
@@ -304,13 +510,15 @@ def run_build_caches(args):
         # 无 Stage 1 模型时，用零值 hidden 生成占位缓存
         # 从配置读取各 stage 的 hidden_dim
         touch_dim = 768  # 默认
+        stage1_dim = 768
         break_dim = 384
         spike_dim = 384
         try:
             import yaml
-            with open(args.config) as f:
+            with open(args.config, encoding='utf-8') as f:
                 cfg = yaml.safe_load(f)
             touch_dim = cfg.get("models", {}).get("touch", {}).get("hidden_dim", 768)
+            stage1_dim = cfg.get("models", {}).get("stage1", {}).get("hidden_dim", 768)
             break_dim = cfg.get("models", {}).get("break", {}).get("hidden_dim", 384)
             spike_dim = cfg.get("models", {}).get("spike", {}).get("hidden_dim", 384)
         except Exception:
@@ -324,7 +532,7 @@ def run_build_caches(args):
                 T = labels["stage1_tokens"].size(0)
 
                 # Touch (768)
-                fake_hidden_t = torch.zeros(T, touch_dim)
+                fake_hidden_t = torch.zeros(T, stage1_dim)
                 fake_audio_t = torch.zeros(64, touch_dim)
                 (cache_root / "touch").mkdir(parents=True, exist_ok=True)
                 torch.save({
@@ -335,7 +543,7 @@ def run_build_caches(args):
                 }, cache_root / "touch" / f"{name}.pt")
 
                 # Break (384)
-                fake_hidden_b = torch.zeros(T, break_dim)
+                fake_hidden_b = torch.zeros(T, stage1_dim)
                 (cache_root / "break").mkdir(parents=True, exist_ok=True)
                 torch.save({
                     "tokens": labels["stage1_tokens"],
@@ -345,7 +553,7 @@ def run_build_caches(args):
                 }, cache_root / "break" / f"{name}.pt")
 
                 # Spike (384)
-                fake_hidden_s = torch.zeros(T, spike_dim)
+                fake_hidden_s = torch.zeros(T, stage1_dim)
                 (cache_root / "spike").mkdir(parents=True, exist_ok=True)
                 torch.save({
                     "tokens": labels["stage1_tokens"],
