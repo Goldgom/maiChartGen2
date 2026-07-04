@@ -173,41 +173,146 @@ def normalize_simai_text_to_maxsubdiv(text: str, maxsubdiv: int = 64) -> str:
 
 def _simplify_stage1_slot(slot: str) -> str:
     """Human-readable stage1 text: no break/firework/durations; slide keeps head."""
+    return _stage_slot_text(
+        slot,
+        include_slide_detail=False,
+        include_button_hold_duration=False,
+        include_touch_hold_duration=False,
+        include_full_touch_pattern=False,
+        include_break=False,
+        include_firework=False,
+    )
+
+
+def _is_touch_piece(piece: str) -> bool:
+    return bool(re.match(r"^([ABDE][1-8]|C\d*)", piece))
+
+
+def _is_slide_piece(piece: str) -> bool:
+    return bool(re.search(r"(pp|qq|[*\-<>^vVpqszw])", piece) and re.search(r"\d", piece))
+
+
+def _strip_break_text(piece: str) -> str:
+    return re.sub(r"b(?=h|/|,|\[|$)", "", piece)
+
+
+def _strip_firework_text(piece: str) -> str:
+    return re.sub(r"f(?=,|/|$)", "", piece)
+
+
+def _slide_head(piece: str) -> str:
+    m = re.search(r"([1-8])", piece)
+    return m.group(1) if m else ""
+
+
+def _touch_head(piece: str) -> str:
+    m = re.match(r"([ABDE][1-8]|C\d*)", piece)
+    if not m:
+        return ""
+    base = m.group(1)
+    if base.startswith("C"):
+        base = "C"
+    if "h" in piece:
+        base += "h"
+    return base
+
+
+def _button_head(piece: str) -> str:
+    m = re.search(r"([1-8])", piece)
+    if not m:
+        return ""
+    base = m.group(1)
+    if "h" in piece:
+        base += "h"
+    return base
+
+
+def _stage_piece_text(
+    piece: str,
+    *,
+    include_slide_detail: bool,
+    include_button_hold_duration: bool,
+    include_touch_hold_duration: bool,
+    include_break: bool,
+    include_firework: bool,
+) -> str:
+    if not piece:
+        return ""
+
+    out = piece
+    if not include_break:
+        out = _strip_break_text(out)
+    if not include_firework:
+        out = _strip_firework_text(out)
+
+    is_touch = _is_touch_piece(out)
+    is_slide = (not is_touch) and _is_slide_piece(out)
+    is_hold = "h" in out and "[" in out
+
+    if is_slide and not include_slide_detail:
+        return _slide_head(out)
+
+    if is_touch:
+        if not include_touch_hold_duration:
+            out = _RE_DURATION.sub("", out)
+        return out
+
+    if is_hold and not include_button_hold_duration:
+        out = _RE_DURATION.sub("", out)
+    return out
+
+
+def _stage_slot_text(
+    slot: str,
+    *,
+    include_slide_detail: bool,
+    include_button_hold_duration: bool,
+    include_touch_hold_duration: bool,
+    include_full_touch_pattern: bool,
+    include_break: bool,
+    include_firework: bool,
+) -> str:
     if not slot or slot == "E":
         return slot
-    body = re.sub(r"b(?=h|/|,|\[|$)", "", slot)
-    body = re.sub(r"f(?=,|/|$)", "", body)
-    body = _RE_DURATION.sub("", body)
-    parts = re.split(r"([/`])", body)
-    simplified: list[str] = []
-    seps: list[str] = []
-    for p in parts:
-        if p in {"/", "`"}:
-            seps.append(p)
+
+    parts = re.split(r"([/`])", slot)
+    output: list[str] = []
+    pending_sep = ""
+    touch_seen = False
+
+    for part in parts:
+        if part in {"/", "`"}:
+            pending_sep = part
             continue
-        if not p:
+        if not part:
             continue
-        m_touch = re.match(r"([ABDE][1-8]|C\d*)", p)
-        if m_touch:
-            base = m_touch.group(1)
-            if base.startswith("C"):
-                base = "C"
-            if "h" in p:
-                base += "h"
-            simplified.append(base)
+
+        simplified = _stage_piece_text(
+            part,
+            include_slide_detail=include_slide_detail,
+            include_button_hold_duration=include_button_hold_duration,
+            include_touch_hold_duration=include_touch_hold_duration,
+            include_break=include_break,
+            include_firework=include_firework,
+        )
+        if not simplified:
             continue
-        m_btn = re.search(r"([1-8])", p)
-        if m_btn:
-            base = m_btn.group(1)
-            if "h" in p:
-                base += "h"
-            simplified.append(base)
-    if not simplified:
-        return ""
-    result = simplified[0]
-    for sep, part in zip(seps, simplified[1:]):
-        result += sep + part
-    return result
+
+        if _is_touch_piece(simplified):
+            if touch_seen and not include_full_touch_pattern:
+                continue
+            touch_seen = True
+
+        if output and pending_sep:
+            output.append(pending_sep)
+        output.append(simplified)
+        pending_sep = "/"
+
+    return "".join(output)
+
+
+def _make_stage_text(prefix: str, slots: list[str], **kwargs) -> str:
+    return prefix + ",".join(_stage_slot_text(s, **kwargs) for s in slots)
 
 
 def make_stage_simai_texts(normalized_text: str) -> dict[str, str]:
@@ -219,16 +324,55 @@ def make_stage_simai_texts(normalized_text: str) -> dict[str, str]:
         prefix = m.group(0)
         body = normalized_text[m.end():]
     slots = _split_simai_slots(body)
-    stage1_slots = [_simplify_stage1_slot(s) for s in slots]
-    stage1_text = prefix + ",".join(stage1_slots)
+    stage1_text = prefix + ",".join(_simplify_stage1_slot(s) for s in slots)
     return {
         "normalized": normalized_text,
         "stage1": stage1_text,
-        "stage2_star": normalized_text,
-        "stage3_hold": normalized_text,
-        "stage4_touch_hold": normalized_text,
-        "stage5_touch": normalized_text,
-        "stage6_break_note": normalized_text,
+        "stage2_star": _make_stage_text(
+            prefix, slots,
+            include_slide_detail=True,
+            include_button_hold_duration=False,
+            include_touch_hold_duration=False,
+            include_full_touch_pattern=False,
+            include_break=False,
+            include_firework=False,
+        ),
+        "stage3_hold": _make_stage_text(
+            prefix, slots,
+            include_slide_detail=True,
+            include_button_hold_duration=True,
+            include_touch_hold_duration=False,
+            include_full_touch_pattern=False,
+            include_break=False,
+            include_firework=False,
+        ),
+        "stage4_touch_hold": _make_stage_text(
+            prefix, slots,
+            include_slide_detail=True,
+            include_button_hold_duration=True,
+            include_touch_hold_duration=True,
+            include_full_touch_pattern=False,
+            include_break=False,
+            include_firework=False,
+        ),
+        "stage5_touch": _make_stage_text(
+            prefix, slots,
+            include_slide_detail=True,
+            include_button_hold_duration=True,
+            include_touch_hold_duration=True,
+            include_full_touch_pattern=True,
+            include_break=False,
+            include_firework=False,
+        ),
+        "stage6_break_note": _make_stage_text(
+            prefix, slots,
+            include_slide_detail=True,
+            include_button_hold_duration=True,
+            include_touch_hold_duration=True,
+            include_full_touch_pattern=True,
+            include_break=True,
+            include_firework=False,
+        ),
         "stage7_firework_note": normalized_text,
     }
 
