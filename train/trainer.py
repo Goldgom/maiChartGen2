@@ -545,7 +545,7 @@ class RotatingMultiStageTrainer:
                     self._pending_best = False
                     if epoch_completed:
                         ep = stage_epoch.get(stage.name, 0)
-                        print(f"[epoch {ep}] 💾 best saved: {self.best_checkpoint}")
+                        print(f"[epoch {ep}] best saved: {self.best_checkpoint}")
                 self.last_checkpoint = self.save(self._checkpoint_name(stage, "last"))
 
         if pbar is not None:

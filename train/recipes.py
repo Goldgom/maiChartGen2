@@ -1,8 +1,9 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Callable, Any
 
+import logging
 import torch
 
 from models.stage1 import MaiGenerator
@@ -19,6 +20,9 @@ class SkipBatchError(RuntimeError):
     pass
 
 
+_WARNED_DIM_MISMATCHES: set[tuple[str, str, int, int]] = set()
+
+
 def _ensure_batch_dim(x: torch.Tensor) -> torch.Tensor:
     if torch.is_tensor(x) and x.dim() in (1, 2) and x.size(0) != 1:
         return x.unsqueeze(0)
@@ -31,9 +35,45 @@ def _as_batch(x: torch.Tensor | None) -> torch.Tensor | None:
     if x.dim() == 0:
         return x.view(1)
     if x.dim() == 1:
-        return x.unsqueeze(0)  # [T] → [1, T]
+        return x.unsqueeze(0)
     return x
 
+
+def _fit_last_dim(
+    tensor: torch.Tensor | None,
+    expected_dim: int | None,
+    *,
+    stage_name: str,
+    field_name: str,
+    batch: dict[str, Any],
+) -> torch.Tensor | None:
+    if tensor is None or expected_dim is None or tensor.dim() == 0:
+        return tensor
+    actual_dim = int(tensor.size(-1))
+    expected_dim = int(expected_dim)
+    if actual_dim == expected_dim:
+        return tensor
+
+    files = _stage2_star_files(batch)
+    warn_key = (stage_name, field_name, actual_dim, expected_dim)
+    if warn_key not in _WARNED_DIM_MISMATCHES:
+        logging.warning(
+            "%s %s dim mismatch: got %d, expected %d; auto-adjusting. files=%s",
+            stage_name,
+            field_name,
+            actual_dim,
+            expected_dim,
+            files,
+        )
+        _WARNED_DIM_MISMATCHES.add(warn_key)
+
+    if actual_dim > expected_dim:
+        return tensor[..., :expected_dim]
+
+    pad_shape = list(tensor.shape)
+    pad_shape[-1] = expected_dim - actual_dim
+    pad = torch.zeros(*pad_shape, dtype=tensor.dtype, device=tensor.device)
+    return torch.cat([tensor, pad], dim=-1)
 
 @dataclass
 class StageRecipe:
@@ -77,8 +117,11 @@ def touch_step(model: TouchRefiner, batch: dict[str, Any], device: torch.device)
     audio_memory = batch.get("audio_memory", None)
     if audio_memory is not None:
         audio_memory = _as_batch(audio_memory).to(device)
+    onset = batch.get("onset")
+    if onset is not None:
+        onset = _as_batch(onset).to(device)
     zone_targets = _as_batch(batch["zone_targets"]).to(device)
-    logits = model(config_tokens, stage1_hidden, audio_memory=audio_memory)
+    logits = model(config_tokens, stage1_hidden, audio_memory=audio_memory, onset=onset)
     loss = model.compute_loss(logits, zone_targets, config_tokens)
     return loss, {"loss": float(loss.detach().item())}
 
@@ -99,12 +142,19 @@ def slide_step(model: SlidePathGenerator, batch: dict[str, Any], device: torch.d
     onset = batch.get("onset")
     if onset is not None:
         onset = _as_batch(onset).to(device)
+    event_slot = batch.get("slot")
+    if event_slot is not None:
+        event_slot = torch.as_tensor(event_slot).long()
+        if event_slot.dim() == 0:
+            event_slot = event_slot.unsqueeze(0)
+        event_slot = event_slot.to(device)
     _validate_stage2_star_batch(model, batch, target_path, start_pos, audio_memory, stage1_hidden, onset)
 
     out = model(
         target_path, start_pos, audio_memory,
         stage1_hidden=stage1_hidden,
         onset=onset,
+        event_slot=event_slot,
     )
     return out["loss"], {"loss": float(out["loss"].detach().item())}
 
@@ -169,6 +219,14 @@ def _validate_stage2_star_batch(
     if start_min < 1 or start_max > 8:
         raise ValueError(f"stage2_star start_pos out of range [{start_min}, {start_max}] from {files}")
 
+    slot_value = batch.get("slot")
+    if slot_value is not None:
+        slot_tensor = torch.as_tensor(slot_value).reshape(-1)
+        slot_min = int(slot_tensor.min().item())
+        slot_max = int(slot_tensor.max().item())
+        if slot_min < 0:
+            raise ValueError(f"stage2_star slot out of range [{slot_min}, {slot_max}] from {files}")
+
     pos_capacity = getattr(getattr(model, "pos_embed", None), "num_embeddings", None)
     if pos_capacity is not None and target_path.size(1) - 1 >= pos_capacity:
         raise SkipBatchError(
@@ -185,45 +243,97 @@ def _validate_stage2_star_batch(
             raise ValueError(f"stage2_star {name} contains NaN/Inf from {files}")
 
 
-# ── Stage 3: Hold 持续时间预测 ──
+# 鈹€鈹€ Stage 3: Hold 鎸佺画鏃堕棿棰勬祴 鈹€鈹€
 
 def hold_step(model: HoldDurationPredictor, batch: dict[str, Any], device: torch.device):
     tokens = _as_batch(batch["tokens"]).to(device)
     stage1_hidden = _as_batch(batch["stage1_hidden"]).to(device)
-    num_targets = _as_batch(batch["dur_num_targets"]).to(device)
-    den_targets = _as_batch(batch["dur_den_targets"]).to(device)
-    hold_mask = _as_batch(batch["hold_mask"]).bool().to(device)
+    stage1_hidden = _fit_last_dim(
+        stage1_hidden,
+        getattr(getattr(model, "stage1_proj", None), "in_features", None),
+        stage_name="hold",
+        field_name="stage1_hidden",
+        batch=batch,
+    )
+    row_targets = torch.as_tensor(batch.get("dur_rows_target", batch.get("dur_num_target")))
+    if row_targets.dim() == 0:
+        row_targets = row_targets.unsqueeze(0)
+    row_targets = row_targets.to(device)
+    query_slots = torch.as_tensor(batch["query_slot"]).long()
+    if query_slots.dim() == 0:
+        query_slots = query_slots.unsqueeze(0)
+    query_slots = query_slots.to(device)
 
     audio_memory = batch.get("audio_memory")
     if audio_memory is not None:
         audio_memory = _as_batch(audio_memory).to(device)
+        audio_memory = _fit_last_dim(
+            audio_memory,
+            getattr(getattr(model, "audio_proj", None), "in_features", None),
+            stage_name="hold",
+            field_name="audio_memory",
+            batch=batch,
+        )
     onset = batch.get("onset")
     if onset is not None:
         onset = _as_batch(onset).to(device)
+        onset = _fit_last_dim(
+            onset,
+            getattr(getattr(model, "onset_proj", None), "in_features", None),
+            stage_name="hold",
+            field_name="onset",
+            batch=batch,
+        )
 
-    out = model(tokens, stage1_hidden, audio_memory=audio_memory, onset=onset)
-    loss = model.compute_loss(out, num_targets, den_targets, hold_mask)
+    out = model(tokens, stage1_hidden, query_slots, audio_memory=audio_memory, onset=onset)
+    loss = model.compute_loss(out, row_targets)
     return loss, {"loss": float(loss.detach().item())}
 
 
-# ── Stage 4: Touch Hold 持续时间预测 ──
+# 鈹€鈹€ Stage 4: Touch Hold 鎸佺画鏃堕棿棰勬祴 鈹€鈹€
 
 def touch_hold_step(model: TouchHoldDurationPredictor, batch: dict[str, Any], device: torch.device):
     tokens = _as_batch(batch["tokens"]).to(device)
     stage1_hidden = _as_batch(batch["stage1_hidden"]).to(device)
-    num_targets = _as_batch(batch["dur_num_targets"]).to(device)
-    den_targets = _as_batch(batch["dur_den_targets"]).to(device)
-    hold_mask = _as_batch(batch["touch_hold_mask"]).bool().to(device)
+    stage1_hidden = _fit_last_dim(
+        stage1_hidden,
+        getattr(getattr(model, "stage1_proj", None), "in_features", None),
+        stage_name="touch_hold",
+        field_name="stage1_hidden",
+        batch=batch,
+    )
+    row_targets = torch.as_tensor(batch.get("dur_rows_target", batch.get("dur_num_target")))
+    if row_targets.dim() == 0:
+        row_targets = row_targets.unsqueeze(0)
+    row_targets = row_targets.to(device)
+    query_slots = torch.as_tensor(batch["query_slot"]).long()
+    if query_slots.dim() == 0:
+        query_slots = query_slots.unsqueeze(0)
+    query_slots = query_slots.to(device)
 
     audio_memory = batch.get("audio_memory")
     if audio_memory is not None:
         audio_memory = _as_batch(audio_memory).to(device)
+        audio_memory = _fit_last_dim(
+            audio_memory,
+            getattr(getattr(model, "audio_proj", None), "in_features", None),
+            stage_name="touch_hold",
+            field_name="audio_memory",
+            batch=batch,
+        )
     onset = batch.get("onset")
     if onset is not None:
         onset = _as_batch(onset).to(device)
+        onset = _fit_last_dim(
+            onset,
+            getattr(getattr(model, "onset_proj", None), "in_features", None),
+            stage_name="touch_hold",
+            field_name="onset",
+            batch=batch,
+        )
 
-    out = model(tokens, stage1_hidden, audio_memory=audio_memory, onset=onset)
-    loss = model.compute_loss(out, num_targets, den_targets, hold_mask)
+    out = model(tokens, stage1_hidden, query_slots, audio_memory=audio_memory, onset=onset)
+    loss = model.compute_loss(out, row_targets)
     return loss, {"loss": float(loss.detach().item())}
 
 
@@ -236,13 +346,16 @@ def touch_pattern_step(model: TouchPatternRefiner, batch: dict[str, Any], device
     audio_memory = batch.get("audio_memory")
     if audio_memory is not None:
         audio_memory = _as_batch(audio_memory).to(device)
+    onset = batch.get("onset")
+    if onset is not None:
+        onset = _as_batch(onset).to(device)
 
-    logits = model(tokens, stage1_hidden, audio_memory=audio_memory)
+    logits = model(tokens, stage1_hidden, audio_memory=audio_memory, onset=onset)
     loss = model.compute_loss(logits, pattern_targets, touch_mask)
     return loss, {"loss": float(loss.detach().item())}
 
 
-# ── Stage 5: Slide Star 精炼 ──
+# 鈹€鈹€ Stage 5: Slide Star 绮剧偧 鈹€鈹€
 
 def star_step(model: SlideStarRefiner, batch: dict[str, Any], device: torch.device):
     coarse_path = _as_batch(batch["coarse_path"]).to(device)
@@ -259,3 +372,4 @@ def star_step(model: SlideStarRefiner, batch: dict[str, Any], device: torch.devi
     out = model(coarse_path, stage1_hidden,
                 audio_memory=audio_memory, onset=onset, target_path=target_path)
     return out["loss"], {"loss": float(out["loss"].detach().item())}
+

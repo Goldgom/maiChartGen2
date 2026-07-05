@@ -273,7 +273,7 @@ def _short_stats(values: list[float]) -> str:
 
 def _path_chart_id(fp: Path, stage: str) -> str:
     stem = fp.stem
-    if stage in {"slide", "stage2_star"}:
+    if stage in {"hold", "touch_hold", "slide", "stage2_star"}:
         stem = stem.rsplit("_", 1)[0]
     return stem
 
@@ -307,6 +307,7 @@ def _inspect_items(items: list[Path], stage: str, max_load: int = 512) -> dict[s
     onset_lens: list[float] = []
     hidden_lens: list[float] = []
     target_lens: list[float] = []
+    row_targets: list[float] = []
     errors: list[str] = []
 
     for fp in items[:max_load]:
@@ -327,6 +328,14 @@ def _inspect_items(items: list[Path], stage: str, max_load: int = 512) -> dict[s
         hidden_len = _tensor_len(data, ("stage1_hidden", "audio_memory"))
         if hidden_len is not None:
             hidden_lens.append(float(hidden_len))
+        if stage in {"hold", "touch_hold"}:
+            if torch.is_tensor(data.get("dur_rows_target")):
+                row_targets.append(float(torch.as_tensor(data["dur_rows_target"]).item()))
+            elif torch.is_tensor(data.get("dur_rows_targets")):
+                mask_key = "hold_mask" if stage == "hold" else "touch_hold_mask"
+                mask = torch.as_tensor(data.get(mask_key, False)).bool()
+                if mask.any():
+                    row_targets.extend(torch.as_tensor(data["dur_rows_targets"])[mask].view(-1).tolist())
 
     return {
         "samples": len(items),
@@ -338,6 +347,7 @@ def _inspect_items(items: list[Path], stage: str, max_load: int = 512) -> dict[s
         "target_lens": target_lens,
         "onset_lens": onset_lens,
         "hidden_lens": hidden_lens,
+        "row_targets": row_targets,
         "errors": errors[:10],
         "examples": [fp.name for fp in items[:5]],
     }
@@ -393,6 +403,8 @@ def print_runtime_dataset_info(
                 logger.info("    onset len: %s", _short_stats(info["onset_lens"]))
             if info["hidden_lens"]:
                 logger.info("    hidden/audio len: %s", _short_stats(info["hidden_lens"]))
+            if info["row_targets"]:
+                logger.info("    hold rows: %s", _short_stats(info["row_targets"]))
             if info["examples"]:
                 logger.info("    examples: %s", ", ".join(info["examples"]))
             if info["errors"]:

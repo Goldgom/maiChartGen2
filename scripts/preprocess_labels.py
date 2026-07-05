@@ -687,9 +687,9 @@ def extract_labels_for_note(note) -> dict:
             "spike": spike_row, "tmask": tmask_row}
 
 
-def _duration_labels(dur: tuple[int, int] | None) -> tuple[int, int]:
-    from models.hold_stage import duration_to_labels
-    return duration_to_labels(dur)
+def _duration_rows(dur: tuple[int, int] | None, maxsubdiv: int) -> int:
+    from models.hold_stage import duration_to_row_count
+    return duration_to_row_count(dur, maxsubdiv=maxsubdiv)
 
 
 def _grid_index_for_note(note, cursor_slots: int, maxsubdiv: int) -> int:
@@ -731,17 +731,16 @@ def build_stage_detail_targets(notes: list, maxsubdiv: int = 64) -> dict[str, An
                     })
 
             if note.is_hold and not note.is_touch_hold and not note.is_slide:
-                num_idx, den_idx = _duration_labels(note.hold_duration)
+                dur_rows = _duration_rows(note.hold_duration, maxsubdiv)
                 hold_events.append({
                     "slot": slot,
                     "note_index": note_index,
                     "positions": torch.tensor(note.positions or [], dtype=torch.long),
-                    "dur_num_target": int(num_idx),
-                    "dur_den_target": int(den_idx),
+                    "dur_rows_target": int(dur_rows),
                 })
 
             if getattr(note, "is_touch_hold", False):
-                num_idx, den_idx = _duration_labels(note.hold_duration)
+                dur_rows = _duration_rows(note.hold_duration, maxsubdiv)
                 zones = []
                 for region in note.touch_regions:
                     try:
@@ -752,8 +751,7 @@ def build_stage_detail_targets(notes: list, maxsubdiv: int = 64) -> dict[str, An
                     "slot": slot,
                     "note_index": note_index,
                     "zones": torch.tensor(zones, dtype=torch.long),
-                    "dur_num_target": int(num_idx),
-                    "dur_den_target": int(den_idx),
+                    "dur_rows_target": int(dur_rows),
                 })
 
             if note.is_touch:

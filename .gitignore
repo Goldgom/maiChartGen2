@@ -8,7 +8,7 @@ dist/
 build/
 
 # Data & Models (too large for git)
-datasets/
+datasets*
 checkpoints/
 .train_cache/
 *.pt

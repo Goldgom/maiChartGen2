@@ -20,6 +20,38 @@ class CacheSample:
     fields: dict[str, Any]
 
 
+def _build_onset_features(data: dict[str, Any]) -> torch.Tensor | None:
+    onset = data.get("onset")
+    if not torch.is_tensor(onset):
+        return None
+    onset = onset.float().view(-1)
+
+    centroid = data.get("centroid")
+    if torch.is_tensor(centroid):
+        centroid_feat = centroid.float().view(-1)
+    else:
+        centroid_feat = torch.zeros_like(onset)
+
+    chroma = data.get("chroma")
+    if torch.is_tensor(chroma) and chroma.dim() >= 2:
+        chroma_feat = chroma.float().view(chroma.size(0), -1).mean(dim=-1)
+    else:
+        chroma_feat = torch.zeros_like(onset)
+
+    target_len = min(onset.numel(), centroid_feat.numel(), chroma_feat.numel())
+    if target_len <= 0:
+        return None
+    return torch.stack(
+        [onset[:target_len], centroid_feat[:target_len], chroma_feat[:target_len]],
+        dim=-1,
+    )
+
+
+def _needs_onset_upgrade(data: dict[str, Any]) -> bool:
+    onset = data.get("onset")
+    return torch.is_tensor(onset) and onset.dim() == 1
+
+
 class StageCacheDataset(Dataset):
     def __init__(
         self,
@@ -37,11 +69,36 @@ class StageCacheDataset(Dataset):
         if max_tokens is not None or max_onset is not None:
             self.items = self._filter_by_length(self.items, max_tokens, max_onset)
 
+    def _load_hidden_features(self, fp: Path) -> dict[str, torch.Tensor]:
+        chart_id = _extract_chart_id(fp, self.stage)
+        hidden_path = self.root / "_hidden" / f"{chart_id}.pt"
+        if hidden_path.exists():
+            hidden = torch.load(hidden_path, map_location="cpu", weights_only=True)
+            out: dict[str, torch.Tensor] = {}
+            if torch.is_tensor(hidden.get("stage1_hidden")):
+                out["stage1_hidden"] = hidden["stage1_hidden"]
+            if torch.is_tensor(hidden.get("audio_memory")):
+                out["audio_memory"] = hidden["audio_memory"]
+            return out
+        return {}
+
+    def _load_stage1_fields(self, fp: Path) -> dict[str, torch.Tensor]:
+        chart_id = _extract_chart_id(fp, self.stage)
+        stage1_path = self.root / "stage1" / f"{chart_id}.pt"
+        if not stage1_path.exists():
+            return {}
+        data = torch.load(stage1_path, map_location="cpu", weights_only=True)
+        out: dict[str, torch.Tensor] = {}
+        onset_features = _build_onset_features(data)
+        if torch.is_tensor(onset_features):
+            out["onset"] = onset_features
+        return out
+
     def _has_supervision(self, data: dict[str, Any]) -> bool:
         if self.stage == "hold":
-            return bool(torch.as_tensor(data.get("hold_mask", False)).bool().any().item())
+            return "query_slot" in data and int(torch.as_tensor(data.get("dur_rows_target", 0)).item()) > 0
         if self.stage == "touch_hold":
-            return bool(torch.as_tensor(data.get("touch_hold_mask", False)).bool().any().item())
+            return "query_slot" in data and int(torch.as_tensor(data.get("dur_rows_target", 0)).item()) > 0
         if self.stage == "stage5_touch":
             return bool(torch.as_tensor(data.get("touch_pattern_mask", False)).bool().any().item())
         if self.stage == "touch":
@@ -132,6 +189,19 @@ class StageCacheDataset(Dataset):
                     self._slide_audio_cache[song_id] = audio_memory
             if torch.is_tensor(audio_memory):
                 data["audio_memory"] = audio_memory
+            if "onset" not in data or _needs_onset_upgrade(data):
+                data.update(self._load_stage1_fields(self.items[idx]))
+            if "stage1_hidden" not in data:
+                data.update(self._load_hidden_features(self.items[idx]))
+        elif self.stage in {"touch", "stage5_touch"}:
+            if "onset" not in data or _needs_onset_upgrade(data):
+                data.update(self._load_stage1_fields(self.items[idx]))
+        elif self.stage in {"hold", "touch_hold"} and (
+            "stage1_hidden" not in data or "audio_memory" not in data
+        ):
+            data.update(self._load_hidden_features(self.items[idx]))
+            if "onset" not in data or _needs_onset_upgrade(data):
+                data.update(self._load_stage1_fields(self.items[idx]))
         data["_file"] = str(self.items[idx])
         return data
 
@@ -228,7 +298,7 @@ def _extract_song_id(filepath: Path, stage: str) -> str:
     # touch/break/spike/hold/touch_hold: {song_id}_lv{N}_{idx}
     # slide/stage2_star: {song_id}_lv{N}_{idx:03d}
     # 先去掉最后的 _{idx} / _{idx:03d}
-    if stage != "stage1":
+    if stage in {"hold", "touch_hold", "slide", "stage2_star"}:
         stem = stem.rsplit("_", 1)[0]
     # 再去掉 _lv{N}
     return _strip_lv_suffix(stem)
@@ -239,7 +309,7 @@ def _extract_chart_id(filepath: Path, stage: str) -> str:
     stem = filepath.stem
     # slide/stage2_star: {song_id}_lv{N}_{idx:03d} → 去掉最后一个 _{idx}
     # touch/break/spike/hold/touch_hold: {song_id}_lv{N}_{idx} → chart_id 包含 _idx
-    if stage in ("slide", "stage2_star"):
+    if stage in ("hold", "touch_hold", "slide", "stage2_star"):
         stem = stem.rsplit("_", 1)[0]
     return stem
 
@@ -428,6 +498,42 @@ class SplitStageDataset(Dataset):
                     self._slide_audio_cache[song_id] = audio_memory
             if torch.is_tensor(audio_memory):
                 data["audio_memory"] = audio_memory
+            if "onset" not in data or _needs_onset_upgrade(data):
+                stage1_path = self.root / "stage1" / f"{_extract_chart_id(self.items[idx], self.stage)}.pt"
+                if stage1_path.exists():
+                    s1 = torch.load(stage1_path, map_location="cpu", weights_only=True)
+                    onset_features = _build_onset_features(s1)
+                    if torch.is_tensor(onset_features):
+                        data["onset"] = onset_features
+            if "stage1_hidden" not in data:
+                hidden_path = self.root / "_hidden" / f"{_extract_chart_id(self.items[idx], self.stage)}.pt"
+                if hidden_path.exists():
+                    hidden = torch.load(hidden_path, map_location="cpu", weights_only=True)
+                    if torch.is_tensor(hidden.get("stage1_hidden")):
+                        data["stage1_hidden"] = hidden["stage1_hidden"]
+        elif self.stage in {"touch", "stage5_touch"}:
+            stage1_path = self.root / "stage1" / f"{_extract_chart_id(self.items[idx], self.stage)}.pt"
+            if ("onset" not in data or _needs_onset_upgrade(data)) and stage1_path.exists():
+                s1 = torch.load(stage1_path, map_location="cpu", weights_only=True)
+                onset_features = _build_onset_features(s1)
+                if torch.is_tensor(onset_features):
+                    data["onset"] = onset_features
+        elif self.stage in {"hold", "touch_hold"} and (
+            "stage1_hidden" not in data or "audio_memory" not in data
+        ):
+            hidden_path = self.root / "_hidden" / f"{_extract_chart_id(self.items[idx], self.stage)}.pt"
+            if hidden_path.exists():
+                hidden = torch.load(hidden_path, map_location="cpu", weights_only=True)
+                if torch.is_tensor(hidden.get("stage1_hidden")):
+                    data["stage1_hidden"] = hidden["stage1_hidden"]
+                if torch.is_tensor(hidden.get("audio_memory")):
+                    data["audio_memory"] = hidden["audio_memory"]
+            stage1_path = self.root / "stage1" / f"{_extract_chart_id(self.items[idx], self.stage)}.pt"
+            if ("onset" not in data or _needs_onset_upgrade(data)) and stage1_path.exists():
+                s1 = torch.load(stage1_path, map_location="cpu", weights_only=True)
+                onset_features = _build_onset_features(s1)
+                if torch.is_tensor(onset_features):
+                    data["onset"] = onset_features
         data["_file"] = str(self.items[idx])
         return data
 

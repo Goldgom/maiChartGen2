@@ -4,6 +4,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from models.audio_context import align_sequence_features
 from Tokenizer.touch_pattern_vocab import TOUCH_PATTERN_NUM_ZONES
 
 
@@ -18,12 +19,14 @@ class TouchPatternRefiner(nn.Module):
         vocab_size: int = 161512,
         dropout: float = 0.1,
         stage1_dim: int = 768,
+        onset_dim: int = 3,
     ):
         super().__init__()
         self.token_embed = nn.Embedding(vocab_size, hidden_dim)
         self.pos_embed = nn.Embedding(16384, hidden_dim)
         self.stage1_proj = nn.Linear(stage1_dim, hidden_dim)
         self.audio_proj = nn.Linear(stage1_dim, hidden_dim)
+        self.onset_proj = nn.Linear(onset_dim, hidden_dim)
         self.layers = nn.ModuleList([
             nn.TransformerEncoderLayer(
                 hidden_dim,
@@ -50,6 +53,7 @@ class TouchPatternRefiner(nn.Module):
         tokens: torch.Tensor,
         stage1_hidden: torch.Tensor,
         audio_memory: torch.Tensor | None = None,
+        onset: torch.Tensor | None = None,
     ) -> torch.Tensor:
         bsz, seq_len = tokens.shape
         stage1_hidden = self._align_hidden(tokens, stage1_hidden)
@@ -59,7 +63,11 @@ class TouchPatternRefiner(nn.Module):
 
         if audio_memory is not None:
             a = self.audio_proj(audio_memory)
-            x = x + a.mean(dim=1, keepdim=True).expand(bsz, seq_len, -1)
+            x = x + align_sequence_features(a, seq_len)
+
+        if onset is not None:
+            o = self.onset_proj(onset.float())
+            x = x + align_sequence_features(o, seq_len)
 
         for layer in self.layers:
             x = layer(x)
