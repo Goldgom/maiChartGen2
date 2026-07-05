@@ -15,6 +15,10 @@ from models.touch_pattern_stage import TouchPatternRefiner
 from Tokenizer.slide_star_vocab import SLD_STAR_VOCAB_SIZE
 
 
+class SkipBatchError(RuntimeError):
+    pass
+
+
 def _ensure_batch_dim(x: torch.Tensor) -> torch.Tensor:
     if torch.is_tensor(x) and x.dim() in (1, 2) and x.size(0) != 1:
         return x.unsqueeze(0)
@@ -167,7 +171,7 @@ def _validate_stage2_star_batch(
 
     pos_capacity = getattr(getattr(model, "pos_embed", None), "num_embeddings", None)
     if pos_capacity is not None and target_path.size(1) - 1 >= pos_capacity:
-        raise ValueError(
+        raise SkipBatchError(
             f"stage2_star target_path too long: len={target_path.size(1)} exceeds pos_embed capacity={pos_capacity} "
             f"from {files}"
         )

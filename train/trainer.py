@@ -4,6 +4,7 @@ import os
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import csv
+import logging
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -14,6 +15,7 @@ from typing import Any, Callable
 import torch
 
 from .checkpoint import load_checkpoint, pack_config, save_checkpoint, _move_optimizer_state
+from .recipes import SkipBatchError
 
 try:
     from tqdm import tqdm
@@ -195,6 +197,13 @@ class RotatingMultiStageTrainer:
             try:
                 with torch.autocast(device_type=self.device.type, enabled=use_amp, dtype=amp_dtype):
                     loss, step_stats = stage.step_fn(stage.model, batch, self.device)
+            except SkipBatchError as e:
+                logging.warning("skip batch in stage '%s': %s", stage.name, e)
+                if inner_pbar is not None:
+                    inner_pbar.update(1)
+                    inner_pbar.set_postfix(skip="1")
+                self._last_batch = batch
+                continue
             except torch.OutOfMemoryError:
                 _print_oom_batch(batch, stage.name, getattr(self, "_last_batch", None))
                 raise
@@ -324,7 +333,11 @@ class RotatingMultiStageTrainer:
         metrics: dict[str, float] = {}
         count = 0
         for batch in stage.val_loader:
-            batch_metrics = stage.val_fn(stage.model, batch, self.device)
+            try:
+                batch_metrics = stage.val_fn(stage.model, batch, self.device)
+            except SkipBatchError as e:
+                logging.warning("skip val batch in stage '%s': %s", stage.name, e)
+                continue
             for k, v in batch_metrics.items():
                 metrics[k] = metrics.get(k, 0.0) + float(v)
             count += 1

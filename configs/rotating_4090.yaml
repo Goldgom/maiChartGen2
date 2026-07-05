@@ -147,6 +147,7 @@ models:
     hidden_dim: 512
     num_layers: 6
     num_heads: 8
+    max_path_len: 128
   break:
     hidden_dim: 384
     num_layers: 4

@@ -28,17 +28,18 @@ class SlidePathGenerator(nn.Module):
     """
 
     def __init__(self, hidden_dim=512, num_layers=6, num_heads=8, dropout=0.1,
-                 stage1_dim: int = 768, onset_dim: int = 3):
+                 stage1_dim: int = 768, onset_dim: int = 3, max_path_len: int = 128):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.bos_token_id = SLD_STAR_BOS
         self.pad_token_id = SLD_STAR_PAD
         self.vocab_size = SLD_STAR_VOCAB_SIZE
+        self.max_path_len = int(max_path_len)
 
         # ── 输入投影 ──
         self.start_embed = nn.Embedding(9, hidden_dim)           # 起始按钮 1-8 + 0
         self.tok_embed = nn.Embedding(SLD_STAR_VOCAB_SIZE, hidden_dim)
-        self.pos_embed = nn.Embedding(64, hidden_dim)             # 最大路径长度
+        self.pos_embed = nn.Embedding(self.max_path_len, hidden_dim)             # 最大路径长度
         self.audio_proj = nn.Linear(stage1_dim, hidden_dim)       # 全局音频
         self.stage1_proj = nn.Linear(stage1_dim, hidden_dim)      # Stage 1 hidden
         self.onset_proj = nn.Linear(onset_dim, hidden_dim)        # 节拍特征
@@ -241,16 +242,17 @@ class SlideStarRefiner(nn.Module):
     """
 
     def __init__(self, hidden_dim=384, num_layers=4, num_heads=6, dropout=0.1,
-                 stage1_dim: int = 768, onset_dim: int = 3):
+                 stage1_dim: int = 768, onset_dim: int = 3, max_path_len: int = 128):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.vocab_size = SLD_STAR_VOCAB_SIZE
         self.bos_token_id = SLD_STAR_BOS
         self.pad_token_id = SLD_STAR_PAD
+        self.max_path_len = int(max_path_len)
 
         # ── 输入投影 ──
         self.coarse_embed = nn.Embedding(SLD_STAR_VOCAB_SIZE, hidden_dim)
-        self.pos_embed = nn.Embedding(64, hidden_dim)
+        self.pos_embed = nn.Embedding(self.max_path_len, hidden_dim)
         self.stage1_proj = nn.Linear(stage1_dim, hidden_dim)
         self.audio_proj = nn.Linear(stage1_dim, hidden_dim)
         self.onset_proj = nn.Linear(onset_dim, hidden_dim)
