@@ -152,6 +152,12 @@ def _build_stage(
         f"{stage}_context_window",
         data_cfg.get("detail_context_window", 512),
     )
+    detail_hidden_cache_size = data_cfg.get(
+        f"{stage}_hidden_cache_size",
+        data_cfg.get("detail_hidden_cache_size", 2),
+    )
+    default_shuffle = not (cache_stage == "stage2_star" and detail_context_window)
+    shuffle_train = bool(data_cfg.get(f"{stage}_shuffle", data_cfg.get("shuffle", default_shuffle)))
 
     # ── 构建训练集 ──
     if train_ids is not None:
@@ -160,6 +166,7 @@ def _build_stage(
             max_tokens=int(max_tokens) if max_tokens is not None else None,
             max_onset=int(max_onset) if max_onset is not None else None,
             detail_context_window=int(detail_context_window) if detail_context_window else None,
+            hidden_cache_size=int(detail_hidden_cache_size) if detail_hidden_cache_size is not None else None,
         )
     else:
         train_dataset = StageCacheDataset(
@@ -167,6 +174,7 @@ def _build_stage(
             max_tokens=int(max_tokens) if max_tokens is not None else None,
             max_onset=int(max_onset) if max_onset is not None else None,
             detail_context_window=int(detail_context_window) if detail_context_window else None,
+            hidden_cache_size=int(detail_hidden_cache_size) if detail_hidden_cache_size is not None else None,
         )
 
     if len(train_dataset) == 0:
@@ -178,7 +186,7 @@ def _build_stage(
     train_loader = build_loader(
         train_dataset,
         batch_size=train_cfg["batch_size"],
-        shuffle=True,
+        shuffle=shuffle_train,
         num_workers=data_cfg.get("num_workers", 0),
     )
 
@@ -190,6 +198,7 @@ def _build_stage(
             max_tokens=int(max_tokens) if max_tokens is not None else None,
             max_onset=int(max_onset) if max_onset is not None else None,
             detail_context_window=int(detail_context_window) if detail_context_window else None,
+            hidden_cache_size=int(detail_hidden_cache_size) if detail_hidden_cache_size is not None else None,
         )
         if len(val_dataset) > 0:
             val_loader = build_loader(

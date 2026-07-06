@@ -8,6 +8,8 @@ data:
   cache_root: /data/maiG_v2/cache
   num_workers: 6
   detail_context_window: 512  # stage2/slide per-event local context rows; avoids full-song tensors per sample
+  detail_hidden_cache_size: 2  # per-worker LRU cache for _hidden files used by detail stages
+  stage2_star_shuffle: false   # keep same-chart events adjacent to avoid random-read stalls
   maxsubdiv: 64              # 谱面归一化网格精度，每 slot = 1/maxsubdiv 拍
 
 # EnCodec 音频编码参数
