@@ -148,6 +148,10 @@ def _build_stage(
     cache_stage = {"star": "slide"}.get(stage, stage)
     max_tokens = data_cfg.get(f"max_{stage}_tokens", data_cfg.get("max_tokens"))
     max_onset = data_cfg.get(f"max_{stage}_onset", data_cfg.get("max_onset"))
+    detail_context_window = data_cfg.get(
+        f"{stage}_context_window",
+        data_cfg.get("detail_context_window", 512),
+    )
 
     # ── 构建训练集 ──
     if train_ids is not None:
@@ -155,12 +159,14 @@ def _build_stage(
             cache_dir, cache_stage, train_ids,
             max_tokens=int(max_tokens) if max_tokens is not None else None,
             max_onset=int(max_onset) if max_onset is not None else None,
+            detail_context_window=int(detail_context_window) if detail_context_window else None,
         )
     else:
         train_dataset = StageCacheDataset(
             cache_dir, cache_stage,
             max_tokens=int(max_tokens) if max_tokens is not None else None,
             max_onset=int(max_onset) if max_onset is not None else None,
+            detail_context_window=int(detail_context_window) if detail_context_window else None,
         )
 
     if len(train_dataset) == 0:
@@ -183,6 +189,7 @@ def _build_stage(
             cache_dir, cache_stage, val_ids,
             max_tokens=int(max_tokens) if max_tokens is not None else None,
             max_onset=int(max_onset) if max_onset is not None else None,
+            detail_context_window=int(detail_context_window) if detail_context_window else None,
         )
         if len(val_dataset) > 0:
             val_loader = build_loader(

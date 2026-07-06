@@ -1070,11 +1070,46 @@ def save_all(result: dict, cache_root: Path) -> None:
             "stage1_simai": simai.get("stage1", ""),
         }, cache_root / "stage1" / f"{chart_id}.pt")
 
+        _clear_chart_samples(cache_root / "slide", chart_id)
+        _clear_chart_samples(cache_root / "stage2_star", chart_id)
+
         # ── slide 训练数据 ──
         for idx, sample in enumerate(labels["slide_compact"]):
             _atomic_save(sample, cache_root / "slide" / f"{chart_id}_{idx:03d}.pt")
-        for idx, sample in enumerate(labels["stage2_star_events"]):
-            _atomic_save(sample, cache_root / "stage2_star" / f"{chart_id}_{idx:03d}.pt")
+        stage1_hidden_len = max(0, int(labels["stage1_tokens"].size(0)) - 1)
+        stage2_idx = 0
+        skipped_stage2 = 0
+        for sample in labels["stage2_star_events"]:
+            sample = dict(sample)
+            slot = int(sample.get("slot", -1)) + 1  # stage1 hidden includes BOS at index 0
+            target_path = sample.get("target_path")
+            if not (0 <= slot < stage1_hidden_len):
+                skipped_stage2 += 1
+                continue
+            if torch.is_tensor(target_path) and target_path.numel() >= 128:
+                skipped_stage2 += 1
+                continue
+            sample["slot"] = slot
+            _atomic_save(sample, cache_root / "stage2_star" / f"{chart_id}_{stage2_idx:03d}.pt")
+            stage2_idx += 1
+        if skipped_stage2:
+            logger.warning("stage2_star skipped %d out-of-range samples for %s", skipped_stage2, chart_id)
+
+
+def _clear_chart_samples(stage_dir: Path, chart_id: str) -> None:
+    failed = 0
+    for old in stage_dir.glob(f"{chart_id}_*.pt"):
+        try:
+            old.unlink()
+        except OSError:
+            failed += 1
+    if failed:
+        logger.warning(
+            "Could not remove %d stale cache files under %s for %s",
+            failed,
+            stage_dir,
+            chart_id,
+        )
 
 
 def _atomic_save(data: Any, path: Path) -> None:

@@ -41,10 +41,15 @@ def _build_onset_features(data: dict[str, Any]) -> torch.Tensor | None:
     target_len = min(onset.numel(), centroid_feat.numel(), chroma_feat.numel())
     if target_len <= 0:
         return None
-    return torch.stack(
+    features = torch.stack(
         [onset[:target_len], centroid_feat[:target_len], chroma_feat[:target_len]],
         dim=-1,
     )
+    features = torch.nan_to_num(features.float(), nan=0.0, posinf=0.0, neginf=0.0)
+    features[:, 1] = torch.log1p(features[:, 1].clamp_min(0.0))
+    mean = features.mean(dim=0, keepdim=True)
+    std = features.std(dim=0, keepdim=True).clamp_min(1e-5)
+    return ((features - mean) / std).clamp(-5.0, 5.0)
 
 
 def _needs_onset_upgrade(data: dict[str, Any]) -> bool:
@@ -59,9 +64,11 @@ class StageCacheDataset(Dataset):
         stage: str,
         max_tokens: int | None = None,
         max_onset: int | None = None,
+        detail_context_window: int | None = None,
     ):
         self.root = Path(root)
         self.stage = stage
+        self.detail_context_window = int(detail_context_window or 0)
         stage_root = self.root / stage
         self.items = sorted(stage_root.glob("*.pt")) if stage_root.exists() else []
         self._slide_audio_cache: dict[str, torch.Tensor] = {}
@@ -186,13 +193,15 @@ class StageCacheDataset(Dataset):
                             "Slide audio_memory 含 NaN: _hidden/%s，已替换为 0", song_id,
                         )
                         audio_memory = torch.nan_to_num(audio_memory, nan=0.0)
-                    self._slide_audio_cache[song_id] = audio_memory
+                    if self.detail_context_window <= 0 or "slot" not in data:
+                        self._slide_audio_cache[song_id] = audio_memory
             if torch.is_tensor(audio_memory):
                 data["audio_memory"] = audio_memory
             if "onset" not in data or _needs_onset_upgrade(data):
                 data.update(self._load_stage1_fields(self.items[idx]))
             if "stage1_hidden" not in data:
                 data.update(self._load_hidden_features(self.items[idx]))
+            _crop_detail_context(data, self.detail_context_window)
         elif self.stage in {"touch", "stage5_touch"}:
             if "onset" not in data or _needs_onset_upgrade(data):
                 data.update(self._load_stage1_fields(self.items[idx]))
@@ -287,6 +296,55 @@ def default_collate(batch: list[dict[str, Any]]) -> dict[str, Any]:
 
 def build_loader(dataset: Dataset, batch_size: int, shuffle: bool, num_workers: int = 0, collate_fn=default_collate):
     return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, num_workers=num_workers, collate_fn=collate_fn, pin_memory=torch.cuda.is_available())
+
+
+def _pad_time_tensor(x: torch.Tensor, target_len: int) -> torch.Tensor:
+    if target_len <= 0 or x.dim() == 0 or x.size(0) >= target_len:
+        return x
+    pad_shape = (target_len - x.size(0),) + tuple(x.shape[1:])
+    return torch.cat([x, x.new_zeros(pad_shape)], dim=0)
+
+
+def _crop_time_tensor(x: torch.Tensor, center: int, window: int) -> tuple[torch.Tensor, int]:
+    if window <= 0 or x.dim() == 0 or x.size(0) <= window:
+        return _pad_time_tensor(x, window), max(0, min(center, max(0, x.size(0) - 1)))
+    center = max(0, min(center, x.size(0) - 1))
+    half = window // 2
+    start = max(0, min(center - half, x.size(0) - window))
+    end = start + window
+    return x[start:end], center - start
+
+
+def _scaled_center(slot: int, src_len: int, ref_len: int) -> int:
+    if src_len <= 1 or ref_len <= 1:
+        return 0
+    return int(round(max(0, slot) * (src_len - 1) / max(1, ref_len - 1)))
+
+
+def _crop_detail_context(data: dict[str, Any], window: int) -> None:
+    if window <= 0 or "slot" not in data:
+        return
+    slot = int(torch.as_tensor(data["slot"]).reshape(-1)[0].item())
+    ref = data.get("stage1_hidden")
+    if not torch.is_tensor(ref):
+        ref = data.get("onset")
+    if not torch.is_tensor(ref) or ref.dim() == 0:
+        return
+
+    ref_len = int(ref.size(0))
+    local_slot = max(0, min(slot, max(0, ref_len - 1)))
+    for key in ("stage1_hidden", "onset"):
+        value = data.get(key)
+        if torch.is_tensor(value) and value.dim() >= 1:
+            cropped, local_slot = _crop_time_tensor(value, slot, window)
+            data[key] = cropped
+
+    audio = data.get("audio_memory")
+    if torch.is_tensor(audio) and audio.dim() >= 1:
+        audio_center = _scaled_center(slot, int(audio.size(0)), ref_len)
+        cropped_audio, _ = _crop_time_tensor(audio, audio_center, window)
+        data["audio_memory"] = cropped_audio
+    data["slot"] = torch.tensor(local_slot, dtype=torch.long)
 
 
 # ── Train / Val Split ─────────────────────────────────────────────────────
@@ -412,9 +470,11 @@ class SplitStageDataset(Dataset):
         song_ids: set[str],
         max_tokens: int | None = None,
         max_onset: int | None = None,
+        detail_context_window: int | None = None,
     ):
         self.root = Path(root)
         self.stage = stage
+        self.detail_context_window = int(detail_context_window or 0)
         stage_root = self.root / stage
         all_items = sorted(stage_root.glob("*.pt")) if stage_root.exists() else []
 
@@ -495,7 +555,8 @@ class SplitStageDataset(Dataset):
                             "SplitStageDataset[slide] audio_memory 含 NaN: _hidden/%s，已替换", song_id,
                         )
                         audio_memory = torch.nan_to_num(audio_memory, nan=0.0)
-                    self._slide_audio_cache[song_id] = audio_memory
+                    if self.detail_context_window <= 0 or "slot" not in data:
+                        self._slide_audio_cache[song_id] = audio_memory
             if torch.is_tensor(audio_memory):
                 data["audio_memory"] = audio_memory
             if "onset" not in data or _needs_onset_upgrade(data):
@@ -511,6 +572,7 @@ class SplitStageDataset(Dataset):
                     hidden = torch.load(hidden_path, map_location="cpu", weights_only=True)
                     if torch.is_tensor(hidden.get("stage1_hidden")):
                         data["stage1_hidden"] = hidden["stage1_hidden"]
+            _crop_detail_context(data, self.detail_context_window)
         elif self.stage in {"touch", "stage5_touch"}:
             stage1_path = self.root / "stage1" / f"{_extract_chart_id(self.items[idx], self.stage)}.pt"
             if ("onset" not in data or _needs_onset_upgrade(data)) and stage1_path.exists():

@@ -258,7 +258,7 @@ def _validate_stage2_star_batch(
                 f"stage2_star slot misaligned with stage1_hidden: max_slot={slot_max} >= stage1_hidden_len={stage1_hidden.size(1)} "
                 f"from {files}"
             )
-        if onset is not None and onset.dim() >= 2 and slot_max >= int(onset.size(1)):
+        if stage1_hidden is None and onset is not None and onset.dim() >= 2 and slot_max >= int(onset.size(1)):
             raise SkipBatchError(
                 f"stage2_star slot misaligned with onset: max_slot={slot_max} >= onset_len={onset.size(1)} "
                 f"from {files}"
