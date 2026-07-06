@@ -139,9 +139,30 @@ def slide_step(model: SlidePathGenerator, batch: dict[str, Any], device: torch.d
     stage1_hidden = batch.get("stage1_hidden")
     if stage1_hidden is not None:
         stage1_hidden = _as_batch(stage1_hidden).to(device)
+        stage1_hidden = _fit_last_dim(
+            stage1_hidden,
+            getattr(getattr(model, "stage1_proj", None), "in_features", None),
+            stage_name="stage2_star",
+            field_name="stage1_hidden",
+            batch=batch,
+        )
     onset = batch.get("onset")
     if onset is not None:
         onset = _as_batch(onset).to(device)
+        onset = _fit_last_dim(
+            onset,
+            getattr(getattr(model, "onset_proj", None), "in_features", None),
+            stage_name="stage2_star",
+            field_name="onset",
+            batch=batch,
+        )
+    audio_memory = _fit_last_dim(
+        audio_memory,
+        getattr(getattr(model, "audio_proj", None), "in_features", None),
+        stage_name="stage2_star",
+        field_name="audio_memory",
+        batch=batch,
+    )
     event_slot = batch.get("slot")
     if event_slot is not None:
         event_slot = torch.as_tensor(event_slot).long()
@@ -226,6 +247,22 @@ def _validate_stage2_star_batch(
         slot_max = int(slot_tensor.max().item())
         if slot_min < 0:
             raise ValueError(f"stage2_star slot out of range [{slot_min}, {slot_max}] from {files}")
+        slot_capacity = getattr(getattr(model, "event_slot_embed", None), "num_embeddings", None)
+        if slot_capacity is not None and slot_max >= slot_capacity:
+            raise SkipBatchError(
+                f"stage2_star slot too large: max_slot={slot_max} exceeds event_slot capacity={slot_capacity} "
+                f"from {files}"
+            )
+        if stage1_hidden is not None and slot_max >= int(stage1_hidden.size(1)):
+            raise SkipBatchError(
+                f"stage2_star slot misaligned with stage1_hidden: max_slot={slot_max} >= stage1_hidden_len={stage1_hidden.size(1)} "
+                f"from {files}"
+            )
+        if onset is not None and onset.dim() >= 2 and slot_max >= int(onset.size(1)):
+            raise SkipBatchError(
+                f"stage2_star slot misaligned with onset: max_slot={slot_max} >= onset_len={onset.size(1)} "
+                f"from {files}"
+            )
 
     pos_capacity = getattr(getattr(model, "pos_embed", None), "num_embeddings", None)
     if pos_capacity is not None and target_path.size(1) - 1 >= pos_capacity:
