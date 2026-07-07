@@ -9,6 +9,7 @@ data:
   cache_root: cache
   num_workers: 4
   maxsubdiv: 64              # 谱面归一化网格精度（每拍分割数）
+  slide_audio_cache_size: 1  # 8GB 显存：每 worker 最多缓存 1 首歌的完整 audio_memory
 
 # EnCodec 音频编码参数
 audio_encodec:

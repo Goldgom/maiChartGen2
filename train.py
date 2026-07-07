@@ -156,6 +156,10 @@ def _build_stage(
         f"{stage}_hidden_cache_size",
         data_cfg.get("detail_hidden_cache_size", 2),
     )
+    slide_audio_cache_size = data_cfg.get(
+        f"{stage}_audio_cache_size",
+        data_cfg.get("slide_audio_cache_size", detail_hidden_cache_size),
+    )
     default_shuffle = not (cache_stage == "stage2_star" and detail_context_window)
     shuffle_train = bool(data_cfg.get(f"{stage}_shuffle", data_cfg.get("shuffle", default_shuffle)))
 
@@ -167,6 +171,7 @@ def _build_stage(
             max_onset=int(max_onset) if max_onset is not None else None,
             detail_context_window=int(detail_context_window) if detail_context_window else None,
             hidden_cache_size=int(detail_hidden_cache_size) if detail_hidden_cache_size is not None else None,
+            slide_audio_cache_size=int(slide_audio_cache_size) if slide_audio_cache_size is not None else None,
         )
     else:
         train_dataset = StageCacheDataset(
@@ -175,6 +180,7 @@ def _build_stage(
             max_onset=int(max_onset) if max_onset is not None else None,
             detail_context_window=int(detail_context_window) if detail_context_window else None,
             hidden_cache_size=int(detail_hidden_cache_size) if detail_hidden_cache_size is not None else None,
+            slide_audio_cache_size=int(slide_audio_cache_size) if slide_audio_cache_size is not None else None,
         )
 
     if len(train_dataset) == 0:
@@ -199,6 +205,7 @@ def _build_stage(
             max_onset=int(max_onset) if max_onset is not None else None,
             detail_context_window=int(detail_context_window) if detail_context_window else None,
             hidden_cache_size=int(detail_hidden_cache_size) if detail_hidden_cache_size is not None else None,
+            slide_audio_cache_size=int(slide_audio_cache_size) if slide_audio_cache_size is not None else None,
         )
         if len(val_dataset) > 0:
             val_loader = build_loader(

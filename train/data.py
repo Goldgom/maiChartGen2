@@ -15,6 +15,9 @@ from torch.utils.data import DataLoader, Dataset
 
 logger = logging.getLogger(__name__)
 
+# ── 元数据缓存键（仅存储用于过滤的轻量字段，避免 init 阶段全量 torch.load）──
+_META_CACHE: dict[str, dict[str, Any]] = {}
+
 
 @dataclass
 class CacheSample:
@@ -58,6 +61,67 @@ def _needs_onset_upgrade(data: dict[str, Any]) -> bool:
     return torch.is_tensor(onset) and onset.dim() == 1
 
 
+# ── 轻量元数据预计算（避免 init 阶段全量 torch.load） ──
+
+def _build_item_meta(fp: Path) -> dict[str, Any]:
+    """从缓存文件提取轻量元数据，只加载必要字段。"""
+    try:
+        data = torch.load(fp, map_location="cpu", weights_only=True)
+    except Exception:
+        return {"_error": True}
+
+    meta: dict[str, Any] = {}
+
+    # token 长度
+    seq = data.get("tokens", data.get("config_tokens", data.get("target_path")))
+    meta["tok_len"] = int(seq.size(-1)) if torch.is_tensor(seq) and seq.dim() >= 1 else 0
+
+    # onset 长度
+    onset = data.get("onset")
+    meta["onset_len"] = int(onset.size(-1)) if torch.is_tensor(onset) and onset.dim() >= 1 else 0
+
+    # 监督字段（只存 bool，不存张量）
+    meta["has_query_slot"] = "query_slot" in data
+    meta["dur_rows_target"] = int(torch.as_tensor(data.get("dur_rows_target", 0)).item()) if "dur_rows_target" in data else 0
+    meta["has_touch_pattern_mask"] = "touch_pattern_mask" in data and bool(
+        torch.as_tensor(data.get("touch_pattern_mask", False)).bool().any().item()
+    )
+    meta["has_zone_targets"] = "zone_targets" in data and bool(
+        torch.as_tensor(data.get("zone_targets", 0)).gt(0).any().item()
+    )
+    meta["has_press_mask"] = "press_mask" in data and bool(
+        torch.as_tensor(data.get("press_mask", False)).bool().any().item()
+    )
+    meta["has_touch_mask"] = "touch_mask" in data and bool(
+        torch.as_tensor(data.get("touch_mask", False)).bool().any().item()
+    )
+
+    # 清理大张量引用
+    del data
+    return meta
+
+
+def _has_supervision_from_meta(stage: str, meta: dict[str, Any]) -> bool:
+    """从元数据判断是否有监督信号。"""
+    if meta.get("_error"):
+        return True  # 无法判断，保留
+    if stage == "hold":
+        return meta.get("has_query_slot", False) and meta.get("dur_rows_target", 0) > 0
+    if stage == "touch_hold":
+        return meta.get("has_query_slot", False) and meta.get("dur_rows_target", 0) > 0
+    if stage == "stage5_touch":
+        return meta.get("has_touch_pattern_mask", False)
+    if stage == "touch":
+        return meta.get("has_zone_targets", False)
+    if stage in {"break", "stage6_break_note"}:
+        return meta.get("has_press_mask", False)
+    if stage in {"spike", "stage7_firework_note"}:
+        return meta.get("has_touch_mask", False)
+    return True
+
+
+# ── StageCacheDataset ──────────────────────────────────────────────────────
+
 class StageCacheDataset(Dataset):
     def __init__(
         self,
@@ -67,18 +131,54 @@ class StageCacheDataset(Dataset):
         max_onset: int | None = None,
         detail_context_window: int | None = None,
         hidden_cache_size: int | None = None,
+        slide_audio_cache_size: int | None = None,
     ):
         self.root = Path(root)
         self.stage = stage
         self.detail_context_window = int(detail_context_window or 0)
         self.hidden_cache_size = int(hidden_cache_size if hidden_cache_size is not None else (2 if self.detail_context_window > 0 else 0))
+        self.slide_audio_cache_size = int(slide_audio_cache_size if slide_audio_cache_size is not None else self.hidden_cache_size)
         stage_root = self.root / stage
         self.items = sorted(stage_root.glob("*.pt")) if stage_root.exists() else []
-        self._slide_audio_cache: dict[str, torch.Tensor] = {}
+
+        # ── 音频缓存改为 LRU（按 song_id），避免无界增长 ──
+        self._slide_audio_cache: OrderedDict[str, torch.Tensor] = OrderedDict()
         self._hidden_cache: OrderedDict[str, dict[str, torch.Tensor]] = OrderedDict()
-        self.items = self._filter_supervised(self.items)
-        if max_tokens is not None or max_onset is not None:
-            self.items = self._filter_by_length(self.items, max_tokens, max_onset)
+
+        # ── 元数据预计算：一次性扫描，避免 init 阶段全量重复 torch.load ──
+        self.items = self._filter_by_meta(self.items, max_tokens, max_onset)
+
+    def _filter_by_meta(
+        self,
+        items: list[Path],
+        max_tokens: int | None,
+        max_onset: int | None,
+    ) -> list[Path]:
+        kept: list[Path] = []
+        skipped_sup = 0
+        skipped_len = 0
+        for fp in items:
+            fp_str = str(fp)
+            if fp_str not in _META_CACHE:
+                _META_CACHE[fp_str] = _build_item_meta(fp)
+            meta = _META_CACHE[fp_str]
+            if not _has_supervision_from_meta(self.stage, meta):
+                skipped_sup += 1
+                continue
+            too_long_tokens = max_tokens is not None and meta.get("tok_len", 0) > max_tokens
+            too_long_onset = max_onset is not None and meta.get("onset_len", 0) > max_onset
+            if too_long_tokens or too_long_onset:
+                skipped_len += 1
+                continue
+            kept.append(fp)
+        if skipped_sup:
+            logger.info("Stage '%s': skipped %d files without supervision", self.stage, skipped_sup)
+        if skipped_len:
+            logger.warning(
+                "Stage '%s': skipped %d over-length files (max_tokens=%s, max_onset=%s)",
+                self.stage, skipped_len, max_tokens, max_onset,
+            )
+        return kept
 
     def _load_hidden_file(self, hidden_path: Path) -> dict[str, torch.Tensor]:
         key = str(hidden_path)
@@ -197,36 +297,54 @@ class StageCacheDataset(Dataset):
             chart_id = _extract_chart_id(self.items[idx], self.stage)
             song_id = _strip_lv_suffix(chart_id)
             hidden_features = self._load_hidden_features(self.items[idx])
-            audio_memory = self._slide_audio_cache.get(song_id)
-            if audio_memory is None:
-                # 查找该歌曲任意图表的 hidden（audio_memory 全曲共享）
+
+            # ── 获取 audio_memory（LRU 缓存） ──
+            audio_memory = self._slide_audio_cache.get(song_id) if self.slide_audio_cache_size > 0 else None
+            if audio_memory is not None:
+                self._slide_audio_cache.move_to_end(song_id)
+            else:
                 audio_memory = hidden_features.get("audio_memory")
-                # fallback: 旧格式 _hidden/{song_id}.pt
                 if torch.is_tensor(audio_memory):
                     if torch.isnan(audio_memory).any():
                         logger.warning(
                             "Slide audio_memory 含 NaN: _hidden/%s，已替换为 0", song_id,
                         )
                         audio_memory = torch.nan_to_num(audio_memory, nan=0.0)
-                    if self.detail_context_window <= 0 or "slot" not in data:
+                    # 无 detail_context_window 或缺少 slot 时缓存全量 audio_memory
+                    if self.slide_audio_cache_size > 0 and (self.detail_context_window <= 0 or "slot" not in data):
                         self._slide_audio_cache[song_id] = audio_memory
+                        self._slide_audio_cache.move_to_end(song_id)
+                        while len(self._slide_audio_cache) > self.slide_audio_cache_size:
+                            self._slide_audio_cache.popitem(last=False)
+
             if torch.is_tensor(audio_memory):
                 data["audio_memory"] = audio_memory
+
+            # ── onset 特征 ──
             if "onset" not in data or _needs_onset_upgrade(data):
                 data.update(self._load_stage1_fields(self.items[idx]))
+
+            # ── stage1_hidden ──
             if "stage1_hidden" not in data:
                 if torch.is_tensor(hidden_features.get("stage1_hidden")):
                     data["stage1_hidden"] = hidden_features["stage1_hidden"]
+
+            # ── 裁切后清理大张量引用，避免双份占用 ──
             _crop_detail_context(data, self.detail_context_window)
+            # 裁切完成后删除不再需要的中间引用
+            hidden_features.clear()
+
         elif self.stage in {"touch", "stage5_touch"}:
             if "onset" not in data or _needs_onset_upgrade(data):
                 data.update(self._load_stage1_fields(self.items[idx]))
+
         elif self.stage in {"hold", "touch_hold"} and (
             "stage1_hidden" not in data or "audio_memory" not in data
         ):
             data.update(self._load_hidden_features(self.items[idx]))
             if "onset" not in data or _needs_onset_upgrade(data):
                 data.update(self._load_stage1_fields(self.items[idx]))
+
         data["_file"] = str(self.items[idx])
         return data
 
@@ -476,7 +594,7 @@ def make_train_val_split(
 
 class SplitStageDataset(Dataset):
     """
-    按 song_id 划分的训练集/验证集 Dataset，封装 StageCacheDataset。
+    按 song_id 划分的训练集/验证集 Dataset。
     """
 
     def __init__(
@@ -488,11 +606,13 @@ class SplitStageDataset(Dataset):
         max_onset: int | None = None,
         detail_context_window: int | None = None,
         hidden_cache_size: int | None = None,
+        slide_audio_cache_size: int | None = None,
     ):
         self.root = Path(root)
         self.stage = stage
         self.detail_context_window = int(detail_context_window or 0)
         self.hidden_cache_size = int(hidden_cache_size if hidden_cache_size is not None else (2 if self.detail_context_window > 0 else 0))
+        self.slide_audio_cache_size = int(slide_audio_cache_size if slide_audio_cache_size is not None else self.hidden_cache_size)
         stage_root = self.root / stage
         all_items = sorted(stage_root.glob("*.pt")) if stage_root.exists() else []
 
@@ -502,60 +622,52 @@ class SplitStageDataset(Dataset):
             if _extract_chart_id(fp, stage) in song_ids
         ]
 
-        self._slide_audio_cache: dict[str, torch.Tensor] = {}
+        # ── 音频缓存改为 LRU ──
+        self._slide_audio_cache: OrderedDict[str, torch.Tensor] = OrderedDict()
         self._hidden_cache: OrderedDict[str, dict[str, torch.Tensor]] = OrderedDict()
-        self.items = self._filter_supervised(self.items)
 
-        if max_tokens is not None or max_onset is not None:
-            self.items = self._filter_by_length(self.items, max_tokens, max_onset)
+        # ── 元数据预计算过滤 ──
+        self.items = self._filter_by_meta(self.items, max_tokens, max_onset)
 
         logger.info(
             "SplitStageDataset[%s]: %d samples (from %d songs)",
             stage, len(self.items), len(song_ids),
         )
 
-    def _has_supervision(self, data: dict[str, Any]) -> bool:
-        return StageCacheDataset._has_supervision(self, data)
-
-    def _filter_supervised(self, items: list[Path]) -> list[Path]:
-        return StageCacheDataset._filter_supervised(self, items)
-
-    def _load_hidden_file(self, hidden_path: Path) -> dict[str, torch.Tensor]:
-        return StageCacheDataset._load_hidden_file(self, hidden_path)
-
-    def _load_hidden_features(self, fp: Path) -> dict[str, torch.Tensor]:
-        return StageCacheDataset._load_hidden_features(self, fp)
-
-    def _filter_by_length(
+    def _filter_by_meta(
         self,
         items: list[Path],
         max_tokens: int | None,
         max_onset: int | None,
     ) -> list[Path]:
         kept: list[Path] = []
-        skipped = 0
+        skipped_sup = 0
+        skipped_len = 0
         for fp in items:
-            try:
-                data = torch.load(fp, map_location="cpu", weights_only=True)
-            except Exception:
-                kept.append(fp)
+            fp_str = str(fp)
+            if fp_str not in _META_CACHE:
+                _META_CACHE[fp_str] = _build_item_meta(fp)
+            meta = _META_CACHE[fp_str]
+            if not _has_supervision_from_meta(self.stage, meta):
+                skipped_sup += 1
                 continue
-            seq = data.get("tokens", data.get("config_tokens", data.get("target_path")))
-            tok_len = int(seq.size(-1)) if torch.is_tensor(seq) and seq.dim() >= 1 else 0
-            onset = data.get("onset")
-            onset_len = int(onset.size(-1)) if torch.is_tensor(onset) and onset.dim() >= 1 else 0
-            too_long_tokens = max_tokens is not None and tok_len > max_tokens
-            too_long_onset = max_onset is not None and onset_len > max_onset
+            too_long_tokens = max_tokens is not None and meta.get("tok_len", 0) > max_tokens
+            too_long_onset = max_onset is not None and meta.get("onset_len", 0) > max_onset
             if too_long_tokens or too_long_onset:
-                skipped += 1
+                skipped_len += 1
                 continue
             kept.append(fp)
-        if skipped:
-            logger.warning(
-                "SplitStageDataset[%s]: skipped %d/%d over-length files",
-                self.stage, skipped, len(items),
-            )
+        if skipped_sup:
+            logger.info("SplitStageDataset[%s]: skipped %d files without supervision", self.stage, skipped_sup)
+        if skipped_len:
+            logger.warning("SplitStageDataset[%s]: skipped %d over-length files", self.stage, skipped_len)
         return kept
+
+    def _load_hidden_file(self, hidden_path: Path) -> dict[str, torch.Tensor]:
+        return StageCacheDataset._load_hidden_file(self, hidden_path)
+
+    def _load_hidden_features(self, fp: Path) -> dict[str, torch.Tensor]:
+        return StageCacheDataset._load_hidden_features(self, fp)
 
     def __len__(self) -> int:
         return len(self.items)
@@ -565,9 +677,13 @@ class SplitStageDataset(Dataset):
         if self.stage in {"slide", "stage2_star"}:
             chart_id = _extract_chart_id(self.items[idx], self.stage)
             song_id = _strip_lv_suffix(chart_id)
-            hidden_features = StageCacheDataset._load_hidden_features(self, self.items[idx])
-            audio_memory = self._slide_audio_cache.get(song_id)
-            if audio_memory is None:
+            hidden_features = self._load_hidden_features(self.items[idx])
+
+            # ── LRU audio_memory 缓存 ──
+            audio_memory = self._slide_audio_cache.get(song_id) if self.slide_audio_cache_size > 0 else None
+            if audio_memory is not None:
+                self._slide_audio_cache.move_to_end(song_id)
+            else:
                 audio_memory = hidden_features.get("audio_memory")
                 if torch.is_tensor(audio_memory):
                     if torch.isnan(audio_memory).any():
@@ -575,8 +691,12 @@ class SplitStageDataset(Dataset):
                             "SplitStageDataset[slide] audio_memory 含 NaN: _hidden/%s，已替换", song_id,
                         )
                         audio_memory = torch.nan_to_num(audio_memory, nan=0.0)
-                    if self.detail_context_window <= 0 or "slot" not in data:
+                    if self.slide_audio_cache_size > 0 and (self.detail_context_window <= 0 or "slot" not in data):
                         self._slide_audio_cache[song_id] = audio_memory
+                        self._slide_audio_cache.move_to_end(song_id)
+                        while len(self._slide_audio_cache) > self.slide_audio_cache_size:
+                            self._slide_audio_cache.popitem(last=False)
+
             if torch.is_tensor(audio_memory):
                 data["audio_memory"] = audio_memory
             if "onset" not in data or _needs_onset_upgrade(data):
@@ -586,10 +706,13 @@ class SplitStageDataset(Dataset):
                     onset_features = _build_onset_features(s1)
                     if torch.is_tensor(onset_features):
                         data["onset"] = onset_features
+                    del s1
             if "stage1_hidden" not in data:
                 if torch.is_tensor(hidden_features.get("stage1_hidden")):
                     data["stage1_hidden"] = hidden_features["stage1_hidden"]
             _crop_detail_context(data, self.detail_context_window)
+            hidden_features.clear()
+
         elif self.stage in {"touch", "stage5_touch"}:
             stage1_path = self.root / "stage1" / f"{_extract_chart_id(self.items[idx], self.stage)}.pt"
             if ("onset" not in data or _needs_onset_upgrade(data)) and stage1_path.exists():
@@ -597,6 +720,8 @@ class SplitStageDataset(Dataset):
                 onset_features = _build_onset_features(s1)
                 if torch.is_tensor(onset_features):
                     data["onset"] = onset_features
+                del s1
+
         elif self.stage in {"hold", "touch_hold"} and (
             "stage1_hidden" not in data or "audio_memory" not in data
         ):
@@ -607,12 +732,15 @@ class SplitStageDataset(Dataset):
                     data["stage1_hidden"] = hidden["stage1_hidden"]
                 if torch.is_tensor(hidden.get("audio_memory")):
                     data["audio_memory"] = hidden["audio_memory"]
+                del hidden
             stage1_path = self.root / "stage1" / f"{_extract_chart_id(self.items[idx], self.stage)}.pt"
             if ("onset" not in data or _needs_onset_upgrade(data)) and stage1_path.exists():
                 s1 = torch.load(stage1_path, map_location="cpu", weights_only=True)
                 onset_features = _build_onset_features(s1)
                 if torch.is_tensor(onset_features):
                     data["onset"] = onset_features
+                del s1
+
         data["_file"] = str(self.items[idx])
         return data
 
