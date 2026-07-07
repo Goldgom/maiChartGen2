@@ -520,6 +520,12 @@ class SplitStageDataset(Dataset):
     def _filter_supervised(self, items: list[Path]) -> list[Path]:
         return StageCacheDataset._filter_supervised(self, items)
 
+    def _load_hidden_file(self, hidden_path: Path) -> dict[str, torch.Tensor]:
+        return StageCacheDataset._load_hidden_file(self, hidden_path)
+
+    def _load_hidden_features(self, fp: Path) -> dict[str, torch.Tensor]:
+        return StageCacheDataset._load_hidden_features(self, fp)
+
     def _filter_by_length(
         self,
         items: list[Path],
