@@ -6,10 +6,11 @@ use_bf16: true
 
 data:
   cache_root: /data/maiG_v2/cache
-  num_workers: 6
+  num_workers: 4              # 减少 worker 数量降低缓存副本
+  prefetch_factor: 1          # 每 worker 只预取 1 个 batch（默认 2）
   detail_context_window: 512  # stage2/slide per-event local context rows; avoids full-song tensors per sample
-  detail_hidden_cache_size: 2  # per-worker LRU cache for _hidden files used by detail stages
-  slide_audio_cache_size: 2    # per-worker LRU cache for full-song audio_memory (only when detail_context_window=0)
+  detail_hidden_cache_size: 0  # 禁用 _hidden 全量缓存（裁切后 clone，缓存无内存收益）
+  slide_audio_cache_size: 0    # 禁用 audio 全量缓存
   stage2_star_shuffle: false   # keep same-chart events adjacent to avoid random-read stalls
   maxsubdiv: 64              # 谱面归一化网格精度，每 slot = 1/maxsubdiv 拍
 
@@ -33,8 +34,8 @@ audio_multiscale:
 train:
   batch_size: 1
   max_turns: 100000
-  max_cpu_memory_gb: 32      # CPU 内存上限（GB），超限触发强制清理 + 保存检查点；0 禁用
-  mem_check_every_turns: 50  # 每 N turns 检查一次内存
+  max_cpu_memory_gb: 32      # CPU 内存上限（GB），超限触发 DataLoader 重建 + 保存检查点；0 禁用
+  mem_check_every_turns: 20  # 每 N turns 检查一次内存
   log_every: 10
   eval_every_turns: 0        # 0=仅在 epoch 完成时验证；>0=额外每 N turns 验证
   save_every_turns: 0        # 0=仅在 epoch 完成时保存；>0=额外每 N turns 保存

@@ -19,6 +19,11 @@ logger = logging.getLogger(__name__)
 _META_CACHE: dict[str, dict[str, Any]] = {}
 
 
+def clear_meta_cache() -> None:
+    """释放 init 阶段累积的元数据缓存（训练时不再需要）。"""
+    _META_CACHE.clear()
+
+
 @dataclass
 class CacheSample:
     fields: dict[str, Any]
@@ -319,7 +324,6 @@ class StageCacheDataset(Dataset):
                             "Slide audio_memory 含 NaN: _hidden/%s，已替换为 0", song_id,
                         )
                         audio_memory = torch.nan_to_num(audio_memory, nan=0.0)
-                    # 无 detail_context_window 或缺少 slot 时缓存全量 audio_memory
                     if self.slide_audio_cache_size > 0 and (self.detail_context_window <= 0 or "slot" not in data):
                         self._slide_audio_cache[song_id] = audio_memory
                         self._slide_audio_cache.move_to_end(song_id)
@@ -338,8 +342,13 @@ class StageCacheDataset(Dataset):
                 if torch.is_tensor(hidden_features.get("stage1_hidden")):
                     data["stage1_hidden"] = hidden_features["stage1_hidden"]
 
-            # ── 裁切后原大张量引用已被 clone 替换，无需额外清理 ──
             _crop_detail_context(data, self.detail_context_window)
+
+            # ── 激进清理：删除 stage2 不需要的字段，避免随 batch 传递 ──
+            _KEEP_KEYS = {"target_path", "start_pos", "slot", "audio_memory", "stage1_hidden", "onset", "_file"}
+            for k in list(data.keys()):
+                if k not in _KEEP_KEYS:
+                    del data[k]
 
         elif self.stage in {"touch", "stage5_touch"}:
             if "onset" not in data or _needs_onset_upgrade(data):
@@ -353,6 +362,9 @@ class StageCacheDataset(Dataset):
                 data.update(self._load_stage1_fields(self.items[idx]))
 
         data["_file"] = str(self.items[idx])
+        if idx % 500 == 0:
+            import gc
+            gc.collect()
         return data
 
 
@@ -451,8 +463,14 @@ def default_collate(batch: list[dict[str, Any]]) -> dict[str, Any]:
     return out
 
 
-def build_loader(dataset: Dataset, batch_size: int, shuffle: bool, num_workers: int = 0, collate_fn=default_collate):
-    return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, num_workers=num_workers, collate_fn=collate_fn, pin_memory=torch.cuda.is_available())
+def build_loader(dataset: Dataset, batch_size: int, shuffle: bool, num_workers: int = 0, collate_fn=default_collate, prefetch_factor: int = 2):
+    return DataLoader(
+        dataset, batch_size=batch_size, shuffle=shuffle,
+        num_workers=num_workers, collate_fn=collate_fn,
+        pin_memory=torch.cuda.is_available(),
+        prefetch_factor=prefetch_factor,
+        persistent_workers=(num_workers > 0),
+    )
 
 
 def _pad_time_tensor(x: torch.Tensor, target_len: int) -> torch.Tensor:
@@ -745,6 +763,12 @@ class SplitStageDataset(Dataset):
                     data["stage1_hidden"] = hidden_features["stage1_hidden"]
             _crop_detail_context(data, self.detail_context_window)
 
+            # ── 激进清理：删除 stage2 不需要的字段 ──
+            _KEEP_KEYS = {"target_path", "start_pos", "slot", "audio_memory", "stage1_hidden", "onset", "_file"}
+            for k in list(data.keys()):
+                if k not in _KEEP_KEYS:
+                    del data[k]
+
         elif self.stage in {"touch", "stage5_touch"}:
             if "onset" not in data or _needs_onset_upgrade(data):
                 chart_id = _extract_chart_id(self.items[idx], self.stage)
@@ -794,6 +818,9 @@ class SplitStageDataset(Dataset):
                             data["onset"] = onset_features
 
         data["_file"] = str(self.items[idx])
+        if idx % 500 == 0:
+            import gc
+            gc.collect()
         return data
 
     def num_songs(self) -> int:

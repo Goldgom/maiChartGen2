@@ -510,10 +510,36 @@ class RotatingMultiStageTrainer:
                     self._mem_check_counter = 0
                     mem_now = get_cpu_memory_gb()
                     if mem_now > self._max_cpu_memory_gb:
-                        self._force_memory_cleanup(f"超过上限 {mem_now:.1f}GB > {self._max_cpu_memory_gb:.0f}GB")
-                        # 保存检查点，以便恢复
+                        # 1. 获取 dataset 引用并清除内部缓存
+                        ds = stage.train_loader.dataset
+                        for attr in ("_hidden_cache", "_slide_audio_cache", "_onset_cache"):
+                            c = getattr(ds, attr, None)
+                            if isinstance(c, dict):
+                                c.clear()
+
+                        # 2. 先建新的 DataLoader，再替换旧的（避免中间态）
+                        from .data import build_loader as _rebuild_loader
+                        data_cfg = self.cfg.get("data", {}) if self.cfg else {}
+                        new_loader = _rebuild_loader(
+                            ds,
+                            batch_size=int(self.cfg.get("train", {}).get("batch_size", 1)) if self.cfg else 1,
+                            shuffle=True,
+                            num_workers=data_cfg.get("num_workers", 0),
+                            prefetch_factor=data_cfg.get("prefetch_factor", 2),
+                        )
+                        old_loader = stage.train_loader
+                        stage.train_loader = new_loader
+                        stage.iterator = cycle(new_loader)
+                        del old_loader  # 释放旧 loader → 终止旧 worker 进程
+
+                        # 3. 强制 CPU 内存回收
+                        self._force_memory_cleanup(f"超过上限 {mem_now:.1f}GB > {self._max_cpu_memory_gb:.0f}GB, 重建 DataLoader")
+                        self._last_batch = None
+
+                        # 4. 保存检查点
                         self.last_checkpoint = self.save(self._checkpoint_name(stage, "memcap"))
-                        print(f"[memcap] RSS={mem_now:.1f}GB > {self._max_cpu_memory_gb:.0f}GB, 已清理并保存至 {self.last_checkpoint}")
+                        mem_after = get_cpu_memory_gb()
+                        print(f"[memcap] RSS {mem_now:.1f} → {mem_after:.1f}GB (已重建 DataLoader), 保存至 {self.last_checkpoint}")
 
             # ── Epoch 跟踪 ──
             epoch_completed = False

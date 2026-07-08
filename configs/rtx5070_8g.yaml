@@ -7,9 +7,11 @@ use_bf16: true
 
 data:
   cache_root: cache
-  num_workers: 4
-  maxsubdiv: 64              # 谱面归一化网格精度（每拍分割数）
-  slide_audio_cache_size: 1  # 8GB 显存：每 worker 最多缓存 1 首歌的完整 audio_memory
+  num_workers: 2              # 8GB 机器减少 worker 数
+  prefetch_factor: 1          # 每 worker 只预取 1 batch
+  maxsubdiv: 64               # 谱面归一化网格精度（每拍分割数）
+  detail_hidden_cache_size: 0 # 禁用全量 hidden 缓存
+  slide_audio_cache_size: 0   # 禁用 audio 缓存
 
 # EnCodec 音频编码参数
 audio_encodec:

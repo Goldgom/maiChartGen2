@@ -12,7 +12,7 @@ from typing import Any
 
 import torch
 
-from train.data import StageCacheDataset, SplitStageDataset, build_loader, make_train_val_split
+from train.data import StageCacheDataset, SplitStageDataset, build_loader, make_train_val_split, clear_meta_cache
 from train.metrics import VAL_FN_MAP
 from train.optim import build_optimizer, build_scheduler
 from train.recipes import break_step, slide_step, spike_step, stage1_step, touch_step, hold_step, touch_hold_step, star_step, touch_pattern_step
@@ -194,6 +194,7 @@ def _build_stage(
         batch_size=train_cfg["batch_size"],
         shuffle=shuffle_train,
         num_workers=data_cfg.get("num_workers", 0),
+        prefetch_factor=data_cfg.get("prefetch_factor", 2),
     )
 
     # ── 构建验证集 ──
@@ -312,6 +313,7 @@ def main():
         stage_names = all_stage_names
 
     stages = [s for s in (_build_stage(stage, cfg, train_ids, val_ids) for stage in stage_names) if s is not None]
+    clear_meta_cache()  # 释放 init 阶段累积的元数据（不再需要）
     precision = "bf16" if cfg.get("use_bf16", False) and torch.cuda.is_available() else str(cfg.get("precision", "amp"))
     trainer = RotatingMultiStageTrainer(
         stages=stages,
