@@ -329,10 +329,8 @@ class StageCacheDataset(Dataset):
                 if torch.is_tensor(hidden_features.get("stage1_hidden")):
                     data["stage1_hidden"] = hidden_features["stage1_hidden"]
 
-            # ── 裁切后清理大张量引用，避免双份占用 ──
+            # ── 裁切后原大张量引用已被 clone 替换，无需额外清理 ──
             _crop_detail_context(data, self.detail_context_window)
-            # 裁切完成后删除不再需要的中间引用
-            hidden_features.clear()
 
         elif self.stage in {"touch", "stage5_touch"}:
             if "onset" not in data or _needs_onset_upgrade(data):
@@ -471,13 +469,13 @@ def _crop_detail_context(data: dict[str, Any], window: int) -> None:
         value = data.get(key)
         if torch.is_tensor(value) and value.dim() >= 1:
             cropped, local_slot = _crop_time_tensor(value, slot, window)
-            data[key] = cropped
+            data[key] = cropped.clone()  # clone 切断对原大张量存储的引用
 
     audio = data.get("audio_memory")
     if torch.is_tensor(audio) and audio.dim() >= 1:
         audio_center = _scaled_center(slot, int(audio.size(0)), ref_len)
         cropped_audio, _ = _crop_time_tensor(audio, audio_center, window)
-        data["audio_memory"] = cropped_audio
+        data["audio_memory"] = cropped_audio.clone()  # clone 切断对原大张量存储的引用
     data["slot"] = torch.tensor(local_slot, dtype=torch.long)
 
 
@@ -711,7 +709,6 @@ class SplitStageDataset(Dataset):
                 if torch.is_tensor(hidden_features.get("stage1_hidden")):
                     data["stage1_hidden"] = hidden_features["stage1_hidden"]
             _crop_detail_context(data, self.detail_context_window)
-            hidden_features.clear()
 
         elif self.stage in {"touch", "stage5_touch"}:
             stage1_path = self.root / "stage1" / f"{_extract_chart_id(self.items[idx], self.stage)}.pt"

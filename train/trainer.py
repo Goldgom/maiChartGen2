@@ -4,6 +4,7 @@ import os
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import csv
+import gc
 import logging
 import time
 from dataclasses import dataclass, field
@@ -283,10 +284,11 @@ class RotatingMultiStageTrainer:
         self.global_turn += 1
         self._maybe_offload(stage, False)
 
-        # 每 turn flush + 定期清理 CUDA 缓存
+        # 每 turn flush + 定期清理内存碎片
         self._time_file.flush()
         if self.device.type == "cuda" and self.global_turn % 10 == 0:
             torch.cuda.empty_cache()
+            gc.collect()  # CPU 侧：回收 torch.load / 切片产生的碎片化内存
 
         return stats
 

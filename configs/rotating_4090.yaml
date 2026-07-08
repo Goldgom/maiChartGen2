@@ -43,22 +43,57 @@ train:
   epochs_per_cycle: 1        # 循环训练中每阶段每轮训练几个 epoch
   stages:
     stage1:
+      batch_size: 1
       turn_batches: 8
       epochs_per_cycle: 1
       grad_accum_steps: 1
+    stage2_star:
+      batch_size: 2
+      turn_batches: 16
+      epochs_per_cycle: 1
+      grad_accum_steps: 1
     touch:
+      batch_size: 2
+      turn_batches: 16
+      epochs_per_cycle: 1
+      grad_accum_steps: 1
+    stage5_touch:
+      batch_size: 2
       turn_batches: 16
       epochs_per_cycle: 1
       grad_accum_steps: 1
     slide:
+      batch_size: 2
       turn_batches: 32
       epochs_per_cycle: 1
       grad_accum_steps: 1
+    hold:
+      batch_size: 2
+      turn_batches: 16
+      epochs_per_cycle: 1
+      grad_accum_steps: 1
+    touch_hold:
+      batch_size: 2
+      turn_batches: 16
+      epochs_per_cycle: 1
+      grad_accum_steps: 1
     break:
+      batch_size: 2
+      turn_batches: 32
+      epochs_per_cycle: 1
+      grad_accum_steps: 1
+    stage6_break_note:
+      batch_size: 2
       turn_batches: 32
       epochs_per_cycle: 1
       grad_accum_steps: 1
     spike:
+      batch_size: 2
+      turn_batches: 32
+      epochs_per_cycle: 1
+      grad_accum_steps: 1
+    stage7_firework_note:
+      batch_size: 2
       turn_batches: 32
       epochs_per_cycle: 1
       grad_accum_steps: 1

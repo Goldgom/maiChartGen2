@@ -41,34 +41,42 @@ train:
   epochs_per_cycle: 1
   stages:
     stage1:
+      batch_size: 1
       turn_batches: 4
       epochs_per_cycle: 1
       grad_accum_steps: 4
     touch:
+      batch_size: 2
       turn_batches: 16
       epochs_per_cycle: 1
       grad_accum_steps: 1
     slide:
+      batch_size: 1
       turn_batches: 8
       epochs_per_cycle: 1
       grad_accum_steps: 2
     hold:
+      batch_size: 2
       turn_batches: 8
       epochs_per_cycle: 1
       grad_accum_steps: 2
     touch_hold:
+      batch_size: 2
       turn_batches: 8
       epochs_per_cycle: 1
       grad_accum_steps: 2
     star:
+      batch_size: 1
       turn_batches: 4
       epochs_per_cycle: 1
       grad_accum_steps: 2
     break:
+      batch_size: 2
       turn_batches: 16
       epochs_per_cycle: 1
       grad_accum_steps: 1
     spike:
+      batch_size: 2
       turn_batches: 16
       epochs_per_cycle: 1
       grad_accum_steps: 1
