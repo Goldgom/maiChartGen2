@@ -103,6 +103,10 @@ def _build_item_meta(fp: Path) -> dict[str, Any]:
 
     # 清理大张量引用
     del data
+    # 每 1000 个文件触发一次 GC，防止 init 扫描阶段碎片累积
+    if hash(fp) % 1000 == 0:
+        import gc
+        gc.collect()
     return meta
 
 
@@ -464,13 +468,15 @@ def default_collate(batch: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 def build_loader(dataset: Dataset, batch_size: int, shuffle: bool, num_workers: int = 0, collate_fn=default_collate, prefetch_factor: int = 2):
-    return DataLoader(
-        dataset, batch_size=batch_size, shuffle=shuffle,
+    kwargs: dict[str, Any] = dict(
+        batch_size=batch_size, shuffle=shuffle,
         num_workers=num_workers, collate_fn=collate_fn,
         pin_memory=torch.cuda.is_available(),
-        prefetch_factor=prefetch_factor,
         persistent_workers=(num_workers > 0),
     )
+    if num_workers > 0:
+        kwargs["prefetch_factor"] = prefetch_factor
+    return DataLoader(dataset, **kwargs)
 
 
 def _pad_time_tensor(x: torch.Tensor, target_len: int) -> torch.Tensor:
