@@ -3,6 +3,15 @@ from __future__ import annotations
 import os
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
+# ── Linux 用 spawn 启 worker，避免 fork COW 继承主进程碎片化的 RSS ──
+import multiprocessing
+import platform
+if platform.system() == "Linux":
+    try:
+        multiprocessing.set_start_method("spawn", force=True)
+    except RuntimeError:
+        pass  # 已经设置过
+
 import argparse
 import ast
 import json

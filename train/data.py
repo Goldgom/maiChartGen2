@@ -103,10 +103,6 @@ def _build_item_meta(fp: Path) -> dict[str, Any]:
 
     # 清理大张量引用
     del data
-    # 每 1000 个文件触发一次 GC，防止 init 扫描阶段碎片累积
-    if hash(fp) % 1000 == 0:
-        import gc
-        gc.collect()
     return meta
 
 
@@ -167,7 +163,7 @@ class StageCacheDataset(Dataset):
         kept: list[Path] = []
         skipped_sup = 0
         skipped_len = 0
-        for fp in items:
+        for i, fp in enumerate(items):
             fp_str = str(fp)
             if fp_str not in _META_CACHE:
                 _META_CACHE[fp_str] = _build_item_meta(fp)
@@ -181,6 +177,15 @@ class StageCacheDataset(Dataset):
                 skipped_len += 1
                 continue
             kept.append(fp)
+            # ── 每 2000 个文件强制 GC + malloc_trim，防止扫描阶段 RSS 堆叠 ──
+            if i > 0 and i % 2000 == 0:
+                import gc
+                gc.collect()
+                try:
+                    import ctypes
+                    ctypes.CDLL("libc.so.6").malloc_trim(0)
+                except Exception:
+                    pass
         if skipped_sup:
             logger.info("Stage '%s': skipped %d files without supervision", self.stage, skipped_sup)
         if skipped_len:
