@@ -71,12 +71,12 @@ train:
       epochs_per_cycle: 1
       grad_accum_steps: 1
     hold:
-      batch_size: 2
+      batch_size: 16
       turn_batches: 16
       epochs_per_cycle: 1
       grad_accum_steps: 1
     touch_hold:
-      batch_size: 2
+      batch_size: 16
       turn_batches: 16
       epochs_per_cycle: 1
       grad_accum_steps: 1
