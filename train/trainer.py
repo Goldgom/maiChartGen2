@@ -49,6 +49,31 @@ def _malloc_trim() -> None:
         pass
 
 
+def _new_loader_iterator(loader: Any) -> Any:
+    return iter(loader)
+
+
+def _next_loader_batch(stage: "StageRuntime") -> Any:
+    if stage.iterator is None:
+        stage.iterator = _new_loader_iterator(stage.train_loader)
+    try:
+        return next(stage.iterator)
+    except StopIteration:
+        stage.iterator = _new_loader_iterator(stage.train_loader)
+        return next(stage.iterator)
+
+
+def _light_batch_info(batch: dict[str, Any] | None) -> dict[str, Any] | None:
+    if batch is None:
+        return None
+    info: dict[str, Any] = {"_file": batch.get("_file", "?")}
+    for key in ("tokens", "config_tokens", "target_path", "onset", "audio_tokens"):
+        value = batch.get(key)
+        if torch.is_tensor(value):
+            info[key] = tuple(value.shape)
+    return info
+
+
 def compact_memory(datasets: list | None = None) -> float:
     """彻底压缩当前进程 RSS：清空 dataset 缓存 + 多轮 GC + malloc_trim。
     应在 DataLoader fork worker 之前调用，避免 COW 放大。
@@ -185,7 +210,7 @@ class RotatingMultiStageTrainer:
             ])
 
         for stage in self.stages:
-            stage.iterator = cycle(stage.train_loader)
+            stage.iterator = _new_loader_iterator(stage.train_loader)
             if not stage.offload_to_cpu:
                 stage.model.to(self.device)
                 _move_optimizer_state(stage.optimizer, self.device)
@@ -253,7 +278,7 @@ class RotatingMultiStageTrainer:
         for batch_idx in range(stage.turn_batches):
             # ── 数据加载计时 ──
             t_data_start = time.perf_counter()
-            batch = next(stage.iterator)
+            batch = _next_loader_batch(stage)
             t_data = (time.perf_counter() - t_data_start) * 1000
 
             # ── Forward 计时 ──
@@ -271,10 +296,10 @@ class RotatingMultiStageTrainer:
                 if inner_pbar is not None:
                     inner_pbar.update(1)
                     inner_pbar.set_postfix(skip="1")
-                self._last_batch = batch
+                self._last_batch_info = _light_batch_info(batch)
                 continue
             except torch.OutOfMemoryError:
-                _print_oom_batch(batch, stage.name, getattr(self, "_last_batch", None))
+                _print_oom_batch(batch, stage.name, None)
                 raise
             if self.device.type == "cuda":
                 torch.cuda.synchronize()
@@ -335,7 +360,7 @@ class RotatingMultiStageTrainer:
                 inner_pbar.set_postfix(loss=f"{float(loss.detach().item()):.4f}")
 
             # 记录当前 batch 作为"上一批"，OOM 时定位疑凶
-            self._last_batch = batch
+            self._last_batch_info = _light_batch_info(batch)
 
         # 末尾未 step 的补刀
         if did_backward:
@@ -550,12 +575,12 @@ class RotatingMultiStageTrainer:
                         )
                         old_loader = stage.train_loader
                         stage.train_loader = new_loader
-                        stage.iterator = cycle(new_loader)
+                        stage.iterator = _new_loader_iterator(new_loader)
                         del old_loader  # 释放旧 loader → 终止旧 worker 进程
 
                         # 3. 强制 CPU 内存回收
                         self._force_memory_cleanup(f"超过上限 {mem_now:.1f}GB > {self._max_cpu_memory_gb:.0f}GB, 重建 DataLoader")
-                        self._last_batch = None
+                        self._last_batch_info = None
 
                         # 4. 保存检查点
                         self.last_checkpoint = self.save(self._checkpoint_name(stage, "memcap"))
@@ -573,7 +598,7 @@ class RotatingMultiStageTrainer:
                 if ds_size > 0 and stage_samples_seen[stage.name] >= ds_size:
                     stage_epoch[stage.name] += 1
                     stage_samples_seen[stage.name] %= ds_size
-                    stage.iterator = cycle(stage.train_loader)
+                    stage.iterator = _new_loader_iterator(stage.train_loader)
                     epoch_completed = True
 
             train_metric_value = stats.get(self.best_metric)
