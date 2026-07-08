@@ -49,6 +49,27 @@ def _malloc_trim() -> None:
         pass
 
 
+def compact_memory(datasets: list | None = None) -> float:
+    """彻底压缩当前进程 RSS：清空 dataset 缓存 + 多轮 GC + malloc_trim。
+    应在 DataLoader fork worker 之前调用，避免 COW 放大。
+    返回清理后 RSS（GB）。"""
+    # 1. 清空所有 dataset 的内部缓存
+    if datasets:
+        for ds in datasets:
+            for attr in ("_hidden_cache", "_slide_audio_cache", "_onset_cache"):
+                c = getattr(ds, attr, None)
+                if isinstance(c, dict):
+                    c.clear()
+    # 2. 多轮 GC
+    for _ in range(3):
+        gc.collect()
+    # 3. 归还内存给 OS
+    _malloc_trim()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    return get_cpu_memory_gb()
+
+
 def _print_oom_batch(batch: dict[str, Any], stage_name: str, prev_batch: dict[str, Any] | None = None) -> None:
     """打印 OOM 时的 batch 信息以辅助定位"""
 

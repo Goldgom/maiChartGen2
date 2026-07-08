@@ -16,7 +16,7 @@ from train.data import StageCacheDataset, SplitStageDataset, build_loader, make_
 from train.metrics import VAL_FN_MAP
 from train.optim import build_optimizer, build_scheduler
 from train.recipes import break_step, slide_step, spike_step, stage1_step, touch_step, hold_step, touch_hold_step, star_step, touch_pattern_step
-from train.trainer import RotatingMultiStageTrainer, StageRuntime
+from train.trainer import RotatingMultiStageTrainer, StageRuntime, compact_memory
 from models import MaiGenerator, TouchRefiner, SlidePathGenerator, BreakClassifier, SpikeClassifier, HoldDurationPredictor, TouchHoldDurationPredictor, TouchPatternRefiner
 from models.slide_stage import SlideStarRefiner
 
@@ -314,6 +314,13 @@ def main():
 
     stages = [s for s in (_build_stage(stage, cfg, train_ids, val_ids) for stage in stage_names) if s is not None]
     clear_meta_cache()  # 释放 init 阶段累积的元数据（不再需要）
+
+    # ── fork 前彻底压缩主进程 RSS，避免 Linux COW 放大到所有 worker ──
+    all_datasets = [s.train_loader.dataset for s in stages]
+    mem_before = compact_memory(all_datasets)
+    import logging
+    logging.info("fork 前主进程 RSS: %.2f GB", mem_before)
+
     precision = "bf16" if cfg.get("use_bf16", False) and torch.cuda.is_available() else str(cfg.get("precision", "amp"))
     trainer = RotatingMultiStageTrainer(
         stages=stages,
