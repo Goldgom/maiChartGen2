@@ -144,6 +144,7 @@ class StageCacheDataset(Dataset):
         # ── 音频缓存改为 LRU（按 song_id），避免无界增长 ──
         self._slide_audio_cache: OrderedDict[str, torch.Tensor] = OrderedDict()
         self._hidden_cache: OrderedDict[str, dict[str, torch.Tensor]] = OrderedDict()
+        self._onset_cache: OrderedDict[str, torch.Tensor] = OrderedDict()  # chart_id → onset
 
         # ── 元数据预计算：一次性扫描，避免 init 阶段全量重复 torch.load ──
         self.items = self._filter_by_meta(self.items, max_tokens, max_onset)
@@ -211,15 +212,23 @@ class StageCacheDataset(Dataset):
 
     def _load_stage1_fields(self, fp: Path) -> dict[str, torch.Tensor]:
         chart_id = _extract_chart_id(fp, self.stage)
+        # onset 特征对同 chart 的所有样本相同，LRU 缓存避免反复 torch.load
+        if chart_id in self._onset_cache:
+            self._onset_cache.move_to_end(chart_id)
+            return {"onset": self._onset_cache[chart_id]}
         stage1_path = self.root / "stage1" / f"{chart_id}.pt"
         if not stage1_path.exists():
             return {}
         data = torch.load(stage1_path, map_location="cpu", weights_only=True)
-        out: dict[str, torch.Tensor] = {}
         onset_features = _build_onset_features(data)
+        del data  # 立即释放完整 stage1 文件的大张量
         if torch.is_tensor(onset_features):
-            out["onset"] = onset_features
-        return out
+            self._onset_cache[chart_id] = onset_features
+            self._onset_cache.move_to_end(chart_id)
+            while len(self._onset_cache) > max(self.hidden_cache_size, 8):
+                self._onset_cache.popitem(last=False)
+            return {"onset": onset_features}
+        return {}
 
     def _has_supervision(self, data: dict[str, Any]) -> bool:
         if self.stage == "hold":
@@ -639,6 +648,7 @@ class SplitStageDataset(Dataset):
         # ── 音频缓存改为 LRU ──
         self._slide_audio_cache: OrderedDict[str, torch.Tensor] = OrderedDict()
         self._hidden_cache: OrderedDict[str, dict[str, torch.Tensor]] = OrderedDict()
+        self._onset_cache: OrderedDict[str, torch.Tensor] = OrderedDict()  # chart_id → onset
 
         # ── 元数据预计算过滤 ──
         self.items = self._filter_by_meta(self.items, max_tokens, max_onset)
@@ -714,31 +724,51 @@ class SplitStageDataset(Dataset):
             if torch.is_tensor(audio_memory):
                 data["audio_memory"] = audio_memory
             if "onset" not in data or _needs_onset_upgrade(data):
-                stage1_path = self.root / "stage1" / f"{_extract_chart_id(self.items[idx], self.stage)}.pt"
-                if stage1_path.exists():
-                    s1 = torch.load(stage1_path, map_location="cpu", weights_only=True)
-                    onset_features = _build_onset_features(s1)
-                    if torch.is_tensor(onset_features):
-                        data["onset"] = onset_features
-                    del s1
+                chart_id = _extract_chart_id(self.items[idx], self.stage)
+                if chart_id in self._onset_cache:
+                    self._onset_cache.move_to_end(chart_id)
+                    data["onset"] = self._onset_cache[chart_id]
+                else:
+                    stage1_path = self.root / "stage1" / f"{chart_id}.pt"
+                    if stage1_path.exists():
+                        s1 = torch.load(stage1_path, map_location="cpu", weights_only=True)
+                        onset_features = _build_onset_features(s1)
+                        del s1
+                        if torch.is_tensor(onset_features):
+                            self._onset_cache[chart_id] = onset_features
+                            self._onset_cache.move_to_end(chart_id)
+                            while len(self._onset_cache) > max(self.hidden_cache_size, 8):
+                                self._onset_cache.popitem(last=False)
+                            data["onset"] = onset_features
             if "stage1_hidden" not in data:
                 if torch.is_tensor(hidden_features.get("stage1_hidden")):
                     data["stage1_hidden"] = hidden_features["stage1_hidden"]
             _crop_detail_context(data, self.detail_context_window)
 
         elif self.stage in {"touch", "stage5_touch"}:
-            stage1_path = self.root / "stage1" / f"{_extract_chart_id(self.items[idx], self.stage)}.pt"
-            if ("onset" not in data or _needs_onset_upgrade(data)) and stage1_path.exists():
-                s1 = torch.load(stage1_path, map_location="cpu", weights_only=True)
-                onset_features = _build_onset_features(s1)
-                if torch.is_tensor(onset_features):
-                    data["onset"] = onset_features
-                del s1
+            if "onset" not in data or _needs_onset_upgrade(data):
+                chart_id = _extract_chart_id(self.items[idx], self.stage)
+                if chart_id in self._onset_cache:
+                    self._onset_cache.move_to_end(chart_id)
+                    data["onset"] = self._onset_cache[chart_id]
+                else:
+                    stage1_path = self.root / "stage1" / f"{chart_id}.pt"
+                    if stage1_path.exists():
+                        s1 = torch.load(stage1_path, map_location="cpu", weights_only=True)
+                        onset_features = _build_onset_features(s1)
+                        del s1
+                        if torch.is_tensor(onset_features):
+                            self._onset_cache[chart_id] = onset_features
+                            self._onset_cache.move_to_end(chart_id)
+                            while len(self._onset_cache) > max(self.hidden_cache_size, 8):
+                                self._onset_cache.popitem(last=False)
+                            data["onset"] = onset_features
 
         elif self.stage in {"hold", "touch_hold"} and (
             "stage1_hidden" not in data or "audio_memory" not in data
         ):
-            hidden_path = self.root / "_hidden" / f"{_extract_chart_id(self.items[idx], self.stage)}.pt"
+            chart_id = _extract_chart_id(self.items[idx], self.stage)
+            hidden_path = self.root / "_hidden" / f"{chart_id}.pt"
             if hidden_path.exists():
                 hidden = torch.load(hidden_path, map_location="cpu", weights_only=True)
                 if torch.is_tensor(hidden.get("stage1_hidden")):
@@ -746,13 +776,22 @@ class SplitStageDataset(Dataset):
                 if torch.is_tensor(hidden.get("audio_memory")):
                     data["audio_memory"] = hidden["audio_memory"]
                 del hidden
-            stage1_path = self.root / "stage1" / f"{_extract_chart_id(self.items[idx], self.stage)}.pt"
-            if ("onset" not in data or _needs_onset_upgrade(data)) and stage1_path.exists():
-                s1 = torch.load(stage1_path, map_location="cpu", weights_only=True)
-                onset_features = _build_onset_features(s1)
-                if torch.is_tensor(onset_features):
-                    data["onset"] = onset_features
-                del s1
+            if "onset" not in data or _needs_onset_upgrade(data):
+                if chart_id in self._onset_cache:
+                    self._onset_cache.move_to_end(chart_id)
+                    data["onset"] = self._onset_cache[chart_id]
+                else:
+                    stage1_path = self.root / "stage1" / f"{chart_id}.pt"
+                    if stage1_path.exists():
+                        s1 = torch.load(stage1_path, map_location="cpu", weights_only=True)
+                        onset_features = _build_onset_features(s1)
+                        del s1
+                        if torch.is_tensor(onset_features):
+                            self._onset_cache[chart_id] = onset_features
+                            self._onset_cache.move_to_end(chart_id)
+                            while len(self._onset_cache) > max(self.hidden_cache_size, 8):
+                                self._onset_cache.popitem(last=False)
+                            data["onset"] = onset_features
 
         data["_file"] = str(self.items[idx])
         return data
