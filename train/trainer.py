@@ -53,12 +53,24 @@ def _new_loader_iterator(loader: Any) -> Any:
     return iter(loader)
 
 
+def _shutdown_loader_iterator(iterator: Any) -> None:
+    if iterator is None:
+        return
+    shutdown = getattr(iterator, "_shutdown_workers", None)
+    if callable(shutdown):
+        try:
+            shutdown()
+        except Exception:
+            pass
+
+
 def _next_loader_batch(stage: "StageRuntime") -> Any:
     if stage.iterator is None:
         stage.iterator = _new_loader_iterator(stage.train_loader)
     try:
         return next(stage.iterator)
     except StopIteration:
+        _shutdown_loader_iterator(stage.iterator)
         stage.iterator = _new_loader_iterator(stage.train_loader)
         return next(stage.iterator)
 
@@ -211,7 +223,7 @@ class RotatingMultiStageTrainer:
             ])
 
         for stage in self.stages:
-            stage.iterator = _new_loader_iterator(stage.train_loader)
+            stage.iterator = None
             if not stage.offload_to_cpu:
                 stage.model.to(self.device)
                 _move_optimizer_state(stage.optimizer, self.device)
@@ -576,7 +588,8 @@ class RotatingMultiStageTrainer:
                         )
                         old_loader = stage.train_loader
                         stage.train_loader = new_loader
-                        stage.iterator = _new_loader_iterator(new_loader)
+                        _shutdown_loader_iterator(stage.iterator)
+                        stage.iterator = None
                         del old_loader  # 释放旧 loader → 终止旧 worker 进程
 
                         # 3. 强制 CPU 内存回收
@@ -597,7 +610,8 @@ class RotatingMultiStageTrainer:
                 if ds_size > 0 and stage_samples_seen[stage.name] >= ds_size:
                     stage_epoch[stage.name] += 1
                     stage_samples_seen[stage.name] %= ds_size
-                    stage.iterator = _new_loader_iterator(stage.train_loader)
+                    _shutdown_loader_iterator(stage.iterator)
+                    stage.iterator = None
                     epoch_completed = True
 
             train_metric_value = stats.get(self.best_metric)
@@ -680,13 +694,21 @@ class RotatingMultiStageTrainer:
                         print(f"[epoch {ep}] best saved: {self.best_checkpoint}")
                 self.last_checkpoint = self.save(self._checkpoint_name(stage, "last"))
 
-        if pbar is not None:
-            pbar.close()
-        self._wait_saves()
-        self._log_file.flush()
-        self._time_file.flush()
-        self._log_file.close()
-        self._time_file.close()
+        try:
+            self._close_iterators()
+        finally:
+            if pbar is not None:
+                pbar.close()
+            self._wait_saves()
+            self._log_file.flush()
+            self._time_file.flush()
+            self._log_file.close()
+            self._time_file.close()
+
+    def _close_iterators(self) -> None:
+        for stage in self.stages:
+            _shutdown_loader_iterator(stage.iterator)
+            stage.iterator = None
 
     def _wait_saves(self) -> None:
         """等待异步保存完成"""
