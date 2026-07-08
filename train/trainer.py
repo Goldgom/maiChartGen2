@@ -144,6 +144,7 @@ class StageRuntime:
     step_fn: Callable[[torch.nn.Module, dict[str, Any], torch.device], tuple[torch.Tensor, dict[str, float]]]
     val_fn: Callable[[torch.nn.Module, dict[str, Any], torch.device], dict[str, float]] | None = None
     turn_batches: int = 1
+    batch_size: int = 1
     grad_accum_steps: int = 1
     offload_to_cpu: bool = False
     iterator: Any = field(default=None, init=False)
@@ -589,9 +590,7 @@ class RotatingMultiStageTrainer:
 
             # ── Epoch 跟踪 ──
             epoch_completed = False
-            samples_this_turn = stage.turn_batches * max(1, int(
-                self.cfg.get("train", {}).get("batch_size", 1)
-            )) if self.cfg else stage.turn_batches
+            samples_this_turn = stage.turn_batches * max(1, int(stage.batch_size))
             if stage.name in stage_samples_seen:
                 stage_samples_seen[stage.name] += samples_this_turn
                 ds_size = stage_dataset_size.get(stage.name, 1)

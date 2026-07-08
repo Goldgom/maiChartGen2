@@ -260,6 +260,7 @@ def _build_stage(
         step_fn=step_map[stage],
         val_fn=VAL_FN_MAP.get(stage),
         turn_batches=int(_stage_value(train_cfg.get("turn_batches"), stage, 1)),
+        batch_size=int(train_cfg.get("batch_size", 1)),
         grad_accum_steps=int(train_cfg.get("grad_accum_steps", 1)),
         offload_to_cpu=bool(train_cfg.get("offload_to_cpu", False)),
     )
@@ -381,8 +382,7 @@ def main():
     for s in stages:
         train_n = len(s.train_loader.dataset)
         val_n = len(s.val_loader.dataset) if s.val_loader else 0
-        batch_size = max(1, int(cfg["train"].get("batch_size", 1)))
-        turns_per_epoch = max(1, math.ceil(train_n / max(1, s.turn_batches * batch_size)))
+        turns_per_epoch = max(1, math.ceil(train_n / max(1, s.turn_batches * max(1, int(s.batch_size)))))
         log.info(
             "  %s: train=%d  val=%d  ~%d turns/epoch",
             s.name, train_n, val_n, turns_per_epoch,

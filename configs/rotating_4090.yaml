@@ -6,7 +6,7 @@ use_bf16: true
 
 data:
   cache_root: /data/maiG_v2/cache
-  num_workers: 4              # 减少 worker 数量降低缓存副本
+  num_workers: 8              # 减少 worker 数量降低缓存副本
   prefetch_factor: 1          # 每 worker 只预取 1 个 batch（默认 2）
   detail_context_window: 512  # stage2/slide per-event local context rows; avoids full-song tensors per sample
   detail_hidden_cache_size: 0  # 禁用 _hidden 全量缓存（裁切后 clone，缓存无内存收益）
