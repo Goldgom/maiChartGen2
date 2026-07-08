@@ -4,8 +4,10 @@ import os
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import csv
+import ctypes
 import gc
 import logging
+import platform
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -22,6 +24,29 @@ try:
     from tqdm import tqdm
 except Exception:  # pragma: no cover
     tqdm = None
+
+try:
+    import psutil
+    _HAS_PSUTIL = True
+except Exception:
+    _HAS_PSUTIL = False
+
+
+def get_cpu_memory_gb() -> float:
+    """返回当前进程 RSS（GB）。"""
+    if _HAS_PSUTIL:
+        return psutil.Process(os.getpid()).memory_info().rss / (1024**3)
+    return -1.0
+
+
+def _malloc_trim() -> None:
+    """Linux: 归还 glibc malloc arena 给 OS；非 Linux 无操作。"""
+    if platform.system() != "Linux":
+        return
+    try:
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except Exception:
+        pass
 
 
 def _print_oom_batch(batch: dict[str, Any], stage_name: str, prev_batch: dict[str, Any] | None = None) -> None:
@@ -146,6 +171,12 @@ class RotatingMultiStageTrainer:
 
         self._compile_models = cfg.get("compile", False) if cfg else False
 
+        # ── CPU 内存上限（触发强制清理 + 保存检查点）──
+        train_cfg = cfg.get("train", {}) if cfg else {}
+        self._max_cpu_memory_gb = float(train_cfg.get("max_cpu_memory_gb", 0) or 0)
+        self._mem_check_every = int(train_cfg.get("mem_check_every_turns", 50))
+        self._mem_check_counter = 0
+
         # 打印混合精度配置
         self._log_precision()
 
@@ -166,6 +197,22 @@ class RotatingMultiStageTrainer:
         target = self.device if to_device else torch.device("cpu")
         stage.model.to(target)
         _move_optimizer_state(stage.optimizer, target)
+
+    def _force_memory_cleanup(self, reason: str = "") -> float:
+        """强制清理 CPU/GPU 内存碎片，返回当前 RSS（GB）。"""
+        gc.collect()
+        gc.collect()  # 两遍确保循环引用被回收
+        if self.device.type == "cuda":
+            torch.cuda.empty_cache()
+        _malloc_trim()
+        mem_gb = get_cpu_memory_gb()
+        if reason:
+            logger = logging.getLogger(__name__)
+            logger.warning(
+                "内存清理 [%s] RSS=%.2f GB (turn=%d step=%d)",
+                reason, mem_gb, self.global_turn, self.global_step,
+            )
+        return mem_gb
 
     def _train_turn(self, stage: StageRuntime) -> dict[str, float]:
         self._maybe_offload(stage, True)
@@ -455,6 +502,18 @@ class RotatingMultiStageTrainer:
 
             stage = next(stage_cycle)
             stats = self._train_turn(stage)
+
+            # ── CPU 内存上限检查：超阈值时强制清理 + 保存检查点 ──
+            if self._max_cpu_memory_gb > 0:
+                self._mem_check_counter += 1
+                if self._mem_check_counter >= self._mem_check_every:
+                    self._mem_check_counter = 0
+                    mem_now = get_cpu_memory_gb()
+                    if mem_now > self._max_cpu_memory_gb:
+                        self._force_memory_cleanup(f"超过上限 {mem_now:.1f}GB > {self._max_cpu_memory_gb:.0f}GB")
+                        # 保存检查点，以便恢复
+                        self.last_checkpoint = self.save(self._checkpoint_name(stage, "memcap"))
+                        print(f"[memcap] RSS={mem_now:.1f}GB > {self._max_cpu_memory_gb:.0f}GB, 已清理并保存至 {self.last_checkpoint}")
 
             # ── Epoch 跟踪 ──
             epoch_completed = False

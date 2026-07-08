@@ -31,6 +31,8 @@ audio_multiscale:
 train:
   batch_size: 1
   max_turns: 100000
+  max_cpu_memory_gb: 16      # 8GB 显存 + 16GB 系统内存上限
+  mem_check_every_turns: 30  # 更频繁检查
   log_every: 10
   eval_every_turns: 0          # 仅 epoch 时验证
   save_every_turns: 0          # 仅 epoch 时保存
