@@ -50,10 +50,20 @@ def _malloc_trim() -> None:
 
 
 def _new_loader_iterator(loader: Any) -> Any:
-    return iter(loader)
+    try:
+        return iter(loader)
+    except ValueError as e:
+        if "closed" not in str(e).lower():
+            raise
+        if hasattr(loader, "_iterator"):
+            loader._iterator = None
+        gc.collect()
+        return iter(loader)
 
 
-def _shutdown_loader_iterator(iterator: Any) -> None:
+def _shutdown_loader_iterator(iterator: Any, loader: Any | None = None) -> None:
+    if iterator is None and loader is not None:
+        iterator = getattr(loader, "_iterator", None)
     if iterator is None:
         return
     shutdown = getattr(iterator, "_shutdown_workers", None)
@@ -62,6 +72,8 @@ def _shutdown_loader_iterator(iterator: Any) -> None:
             shutdown()
         except Exception:
             pass
+    if loader is not None and getattr(loader, "_iterator", None) is iterator:
+        loader._iterator = None
 
 
 def _next_loader_batch(stage: "StageRuntime") -> Any:
@@ -70,7 +82,7 @@ def _next_loader_batch(stage: "StageRuntime") -> Any:
     try:
         return next(stage.iterator)
     except StopIteration:
-        _shutdown_loader_iterator(stage.iterator)
+        stage.iterator = None
         stage.iterator = _new_loader_iterator(stage.train_loader)
         return next(stage.iterator)
 
@@ -162,6 +174,7 @@ class StageRuntime:
     iterator: Any = field(default=None, init=False)
     steps_done: int = field(default=0, init=False)
     turns_done: int = field(default=0, init=False)
+    last_turn_batches: int = field(default=0, init=False)
 
 
 class RotatingMultiStageTrainer:
@@ -273,7 +286,7 @@ class RotatingMultiStageTrainer:
             )
         return mem_gb
 
-    def _train_turn(self, stage: StageRuntime) -> dict[str, float]:
+    def _train_turn(self, stage: StageRuntime, max_batches: int | None = None) -> dict[str, float]:
         self._maybe_offload(stage, True)
         stage.model.train()
         stats: dict[str, float] = {}
@@ -283,12 +296,13 @@ class RotatingMultiStageTrainer:
         did_scaled_backward = False
         did_step = False
         inner_pbar = None
-        if tqdm is not None and stage.turn_batches > 1:
-            inner_pbar = tqdm(total=stage.turn_batches, desc=f"{stage.name}", leave=False, dynamic_ncols=True)
+        turn_batches = min(stage.turn_batches, max(1, int(max_batches))) if max_batches is not None else stage.turn_batches
+        if tqdm is not None and turn_batches > 1:
+            inner_pbar = tqdm(total=turn_batches, desc=f"{stage.name}", leave=False, dynamic_ncols=True)
 
         t_turn_start = time.perf_counter()
 
-        for batch_idx in range(stage.turn_batches):
+        for batch_idx in range(turn_batches):
             # ── 数据加载计时 ──
             t_data_start = time.perf_counter()
             batch = _next_loader_batch(stage)
@@ -322,7 +336,7 @@ class RotatingMultiStageTrainer:
                 stats["nan_loss"] = float(loss.detach().item()) if torch.is_tensor(loss) else float("nan")
                 continue
 
-            loss = loss / max(1, stage.turn_batches * accum_steps)
+            loss = loss / max(1, turn_batches * accum_steps)
 
             # ── Backward 计时 ──
             if self.device.type == "cuda":
@@ -385,7 +399,8 @@ class RotatingMultiStageTrainer:
 
         if stage.scheduler is not None and did_step:
             stage.scheduler.step()
-        stage.steps_done += stage.turn_batches
+        stage.last_turn_batches = turn_batches
+        stage.steps_done += turn_batches
         stage.turns_done += 1
         self.global_turn += 1
         self._maybe_offload(stage, False)
@@ -560,7 +575,15 @@ class RotatingMultiStageTrainer:
                     break
 
             stage = next(stage_cycle)
-            stats = self._train_turn(stage)
+            batches_this_turn = stage.turn_batches
+            if max_epochs is not None:
+                ds_size = stage_dataset_size.get(stage.name, 0)
+                if ds_size > 0:
+                    batch_size = max(1, int(stage.batch_size))
+                    remaining_samples = max(0, ds_size - stage_samples_seen.get(stage.name, 0))
+                    remaining_batches = (remaining_samples + batch_size - 1) // batch_size
+                    batches_this_turn = max(1, min(stage.turn_batches, remaining_batches))
+            stats = self._train_turn(stage, max_batches=batches_this_turn)
 
             # ── CPU 内存上限检查：超阈值时强制清理 + 保存检查点 ──
             if self._max_cpu_memory_gb > 0:
@@ -588,7 +611,7 @@ class RotatingMultiStageTrainer:
                         )
                         old_loader = stage.train_loader
                         stage.train_loader = new_loader
-                        _shutdown_loader_iterator(stage.iterator)
+                        _shutdown_loader_iterator(stage.iterator, old_loader)
                         stage.iterator = None
                         del old_loader  # 释放旧 loader → 终止旧 worker 进程
 
@@ -603,14 +626,13 @@ class RotatingMultiStageTrainer:
 
             # ── Epoch 跟踪 ──
             epoch_completed = False
-            samples_this_turn = stage.turn_batches * max(1, int(stage.batch_size))
+            samples_this_turn = stage.last_turn_batches * max(1, int(stage.batch_size))
             if stage.name in stage_samples_seen:
                 stage_samples_seen[stage.name] += samples_this_turn
                 ds_size = stage_dataset_size.get(stage.name, 1)
                 if ds_size > 0 and stage_samples_seen[stage.name] >= ds_size:
                     stage_epoch[stage.name] += 1
                     stage_samples_seen[stage.name] %= ds_size
-                    _shutdown_loader_iterator(stage.iterator)
                     stage.iterator = None
                     epoch_completed = True
 
@@ -707,7 +729,7 @@ class RotatingMultiStageTrainer:
 
     def _close_iterators(self) -> None:
         for stage in self.stages:
-            _shutdown_loader_iterator(stage.iterator)
+            _shutdown_loader_iterator(stage.iterator, stage.train_loader)
             stage.iterator = None
 
     def _wait_saves(self) -> None:
