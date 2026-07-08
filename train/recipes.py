@@ -128,6 +128,14 @@ def touch_step(model: TouchRefiner, batch: dict[str, Any], device: torch.device)
 
 def slide_step(model: SlidePathGenerator, batch: dict[str, Any], device: torch.device):
     target_path = _as_batch(batch["target_path"]).to(device)
+    # 变长 target_path 已由 collate pad 为 0，替换为正确的 SLD_STAR_PAD
+    tp_lengths = batch.get("target_path_lengths")
+    if tp_lengths is not None:
+        tp_lengths = torch.as_tensor(tp_lengths, dtype=torch.long, device=device)
+        max_len = target_path.size(1)
+        mask = torch.arange(max_len, device=device).unsqueeze(0) < tp_lengths.unsqueeze(1)
+        from Tokenizer.slide_star_vocab import SLD_STAR_PAD
+        target_path = torch.where(mask, target_path, torch.full_like(target_path, SLD_STAR_PAD))
     audio_memory = batch.get("audio_memory")
     if audio_memory is None:
         in_dim = getattr(getattr(model, "audio_proj", None), "in_features", 768)

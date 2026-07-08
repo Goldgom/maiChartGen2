@@ -419,10 +419,26 @@ def default_collate(batch: list[dict[str, Any]]) -> dict[str, Any]:
     out: dict[str, Any] = {}
     for key in keys:
         values = [item[key] for item in batch]
-        if torch.is_tensor(values[0]):
-            out[key] = torch.stack(values, dim=0)
-        else:
+        if not torch.is_tensor(values[0]):
             out[key] = values
+        else:
+            shapes = [v.shape for v in values]
+            if all(s == shapes[0] for s in shapes):
+                out[key] = torch.stack(values, dim=0)
+            else:
+                # 变长张量：沿第 0 维 pad 到等长再 stack，同时记录原始长度
+                max_len = max(s[0] for s in shapes)
+                tail_dims = shapes[0][1:]
+                lengths = torch.tensor([s[0] for s in shapes], dtype=torch.long)
+                out[f"{key}_lengths"] = lengths
+                padded = []
+                for v in values:
+                    if v.size(0) < max_len:
+                        pad = (0,) * (len(tail_dims) * 2) + (0, max_len - v.size(0))
+                        padded.append(torch.nn.functional.pad(v, pad, value=0))
+                    else:
+                        padded.append(v)
+                out[key] = torch.stack(padded, dim=0)
     return out
 
 
