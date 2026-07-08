@@ -51,7 +51,7 @@ train:
       epochs_per_cycle: 1
       grad_accum_steps: 1
     slide:
-      batch_size: 1
+      batch_size: 4
       turn_batches: 8
       epochs_per_cycle: 1
       grad_accum_steps: 2
