@@ -68,12 +68,22 @@ def touch_hold_val_fn(model, batch: dict, device: torch.device) -> dict[str, flo
     return {"val_loss": float(loss.detach().item())}
 
 
+def touch_pattern_val_fn(model, batch: dict, device: torch.device) -> dict[str, float]:
+    from train.recipes import touch_pattern_step
+    loss, stats = touch_pattern_step(model, batch, device)
+    return {"val_loss": float(loss.detach().item())}
+
+
 VAL_FN_MAP: dict[str, callable] = {
     "stage1": stage1_val_fn,
     "touch": touch_val_fn,
     "slide": slide_val_fn,
+    "stage2_star": slide_val_fn,
     "break": break_val_fn,
+    "stage6_break_note": break_val_fn,
     "spike": spike_val_fn,
+    "stage7_firework_note": spike_val_fn,
     "hold": hold_val_fn,
     "touch_hold": touch_hold_val_fn,
+    "stage5_touch": touch_pattern_val_fn,
 }

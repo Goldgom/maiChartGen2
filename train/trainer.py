@@ -205,9 +205,11 @@ class RotatingMultiStageTrainer:
         self.keep_last = keep_last
         self.best_metric = best_metric
         self.best_mode = best_mode
-        self.best_score = float("inf") if best_mode == "min" else float("-inf")
+        initial_best = float("inf") if best_mode == "min" else float("-inf")
+        self.best_scores: dict[str, float] = {stage.name: initial_best for stage in self.stages}
+        self._pending_best: dict[str, bool] = {stage.name: False for stage in self.stages}
         self.last_checkpoint: Path | None = None
-        self.best_checkpoint: Path | None = None
+        self.best_checkpoints: dict[str, Path] = {}
         self.global_step = 0
         self.global_turn = 0
         self.cfg = cfg
@@ -430,22 +432,24 @@ class RotatingMultiStageTrainer:
         stage.optimizer.zero_grad(set_to_none=True)
         return True
 
-    def _should_improve(self, value: float) -> bool:
+    def _should_improve(self, stage: StageRuntime, value: float) -> bool:
+        current = self.best_scores.get(
+            stage.name,
+            float("inf") if self.best_mode == "min" else float("-inf"),
+        )
         if self.best_mode == "min":
-            return value < self.best_score
-        return value > self.best_score
+            return value < current
+        return value > current
 
-    def _update_best(self, value: float) -> bool:
-        if self._should_improve(value):
-            self.best_score = value
-            self._pending_best = True  # 延迟到 save 周期
+    def _update_best(self, stage: StageRuntime, value: float) -> bool:
+        if self._should_improve(stage, value):
+            self.best_scores[stage.name] = value
+            self._pending_best[stage.name] = True
             return True
         return False
 
     def _checkpoint_name(self, stage: StageRuntime, kind: str) -> str:
-        if len(self.stages) == 1:
-            return f"{stage.name}/{kind}.pt"
-        return f"{kind}.pt"
+        return f"{stage.name}/{kind}.pt"
 
     @torch.no_grad()
     def _validate(self, stage: StageRuntime) -> dict[str, float]:
@@ -477,6 +481,7 @@ class RotatingMultiStageTrainer:
         payload: dict[str, Any] = {
             "global_step": self.global_step,
             "global_turn": self.global_turn,
+            "best_scores": dict(self.best_scores),
             "cfg": pack_config(self.cfg),
             "stages": [],
         }
@@ -524,6 +529,11 @@ class RotatingMultiStageTrainer:
         if restore_progress:
             self.global_step = int(payload.get("global_step", 0))
             self.global_turn = int(payload.get("global_turn", 0))
+            loaded_best = payload.get("best_scores", {})
+            if isinstance(loaded_best, dict):
+                for stage in self.stages:
+                    if stage.name in loaded_best:
+                        self.best_scores[stage.name] = float(loaded_best[stage.name])
         stage_payloads = {s["name"]: s for s in payload.get("stages", [])}
         for stage in self.stages:
             if stage.name not in stage_payloads:
@@ -636,7 +646,7 @@ class RotatingMultiStageTrainer:
                     stage.iterator = None
                     epoch_completed = True
 
-            train_metric_value = stats.get(self.best_metric)
+            train_metric_value = stats.get(self.best_metric, stats.get("loss"))
 
             if pbar is not None:
                 if max_epochs is not None:
@@ -689,13 +699,13 @@ class RotatingMultiStageTrainer:
                     tag = "epoch" if epoch_completed else "val"
                     print(f"[{tag} {stage_epoch.get(stage.name, 0)} | turn {self.global_turn} | step {self.global_step}] {stage.name}: {msg}")
                     # 用验证集指标判断 best
-                    val_metric = val.get("val_loss", val.get(self.best_metric))
+                    val_metric = val.get(self.best_metric, val.get("val_loss"))
                     if val_metric is not None and torch.isfinite(torch.tensor(val_metric)):
-                        best_updated = self._update_best(float(val_metric))
+                        best_updated = self._update_best(stage, float(val_metric))
                 elif epoch_completed:
                     # epoch 完成但无验证集：回退用训练 loss
                     if train_metric_value is not None and torch.isfinite(torch.tensor(train_metric_value)):
-                        best_updated = self._update_best(float(train_metric_value))
+                        best_updated = self._update_best(stage, float(train_metric_value))
 
             # ── 保存 ──
             periodic_save = (
@@ -708,12 +718,12 @@ class RotatingMultiStageTrainer:
                 or self.global_turn == max_turns
             )
             if save_this_turn:
-                if getattr(self, "_pending_best", False):
-                    self.best_checkpoint = self.save(self._checkpoint_name(stage, "best"))
-                    self._pending_best = False
+                if self._pending_best.get(stage.name, False):
+                    self.best_checkpoints[stage.name] = self.save(self._checkpoint_name(stage, "best"))
+                    self._pending_best[stage.name] = False
                     if epoch_completed:
                         ep = stage_epoch.get(stage.name, 0)
-                        print(f"[epoch {ep}] best saved: {self.best_checkpoint}")
+                        print(f"[epoch {ep}] best saved: {self.best_checkpoints[stage.name]}")
                 self.last_checkpoint = self.save(self._checkpoint_name(stage, "last"))
 
         try:
