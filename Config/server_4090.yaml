@@ -1,0 +1,119 @@
+# ============================================================
+# maiChartGen3 服务器训练配置 (RTX 4090 / 16GB VRAM)
+# ============================================================
+# 使用: python train_loop.py --config server_4090
+# 或修改 Config/default.yaml 中相应项
+#
+# 保守估算: 16GB 显存
+# 实际 4090 有 24GB, 留 8GB 余量用于 EnCodec/beat_this 等
+
+paths:
+  datasets_dir: datasets
+  output_dir: /data/maiG_v2/output
+  model_dir: /data/maiG_v2/checkpoints
+  cache_dir: /data/maiG_v2/cache
+
+# ---- 音频 ----
+audio:
+  model_id: facebook/encodec_24khz
+  premodel_path: "premodels/encodec_24khz"
+  num_codebooks: 8          # 8 codebook 完整频谱
+  device: cuda
+
+# ---- 谱面 ----
+chart:
+  max_difficulty: 6
+  target_subdiv: 32         # 32 分拍 (更精细的时序分辨率)
+
+# ---- 节拍 ----
+beat:
+  method: librosa
+  use_chart_bpm: true
+
+# ---- 预处理 ----
+preprocess:
+  output_dir: /data/maiG_v2/preprocessed
+  audio_codebooks: 8
+  beat_method: librosa
+  frame_rate: 0
+  max_charts: 0
+  skip_existing: true
+
+# ---- 标签 ----
+tags:
+  auto_tags: designer,difficulty,dx_type
+  use_collections: true
+  tag_vocab_path: /data/maiG_v2/preprocessed/tag_vocab.json
+
+# ---- Stage 模型 (适配 16GB) ----
+stage_model:
+  model_type: transformer
+  d_model: 512               # 模型宽度
+  n_head: 8                  # 注意力头
+  n_layer: 6                 # Transformer 层数
+  d_ff: 2048                 # FF 中间维度
+  dropout: 0.1
+  hold_dur_bins: 64
+  slide_vocab_size: 512
+
+# ---- 训练循环 ----
+stage1_model:
+  n_layer: 6
+
+stage2_model:
+  n_layer: 6
+
+stage3_model:
+  n_layer: 6
+
+stage4_model:
+  n_layer: 6
+
+stage5_model:
+  n_layer: 6
+
+train_loop:
+  start_stage: 1
+  epochs_per_stage: 5
+  val_samples_per_difficulty: 25
+  val_check_interval: 500    # 每 500 step 验证
+  save_best_only: true
+  max_frames: 0              # 0=full chart
+  refine_max_frames: 2048    # Stage2-5 window to avoid T^2 OOM
+  max_rounds: 0              # 0=无限循环
+
+# ---- 训练超参 ----
+training:
+  batch_size: 4              # 单卡 4090 subdiv=32 保守 4
+  gradient_accumulation_steps: 4   # 有效 batch = 4×4 = 16
+  learning_rate: 0.0003
+  min_learning_rate: 0.000001
+  warmup_steps: 2000
+  max_epochs: 100
+  optimizer: adamw
+  weight_decay: 0.01
+  scheduler: cosine
+  grad_clip: 1.0
+
+# ---- 模型 (全局, 用于向下兼容) ----
+model:
+  d_model: 512
+  n_head: 8
+  n_layer: 6
+  n_audio_codebooks: 8
+  max_seq_len: 4096
+  dropout: 0.1
+  use_cross_attention: true
+
+# ---- 日志 ----
+logging:
+  log_dir: /data/maiG_v2/logs
+  log_every_steps: 100
+  use_wandb: true
+  wandb_project: maiChartGen3
+
+# ---- 生成 ----
+generation:
+  temperature: 0.8
+  top_k: 50
+  top_p: 0.95

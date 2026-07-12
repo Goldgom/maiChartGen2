@@ -1,0 +1,492 @@
+# ============================================================
+# maiChartGen3 配置文件模板
+# ============================================================
+# 将此文件复制为 default.yaml 或自定义名称，修改后通过 ConfigLoader 加载。
+#
+# 格式说明:
+#   - #  开头的行是注释
+#   - 每个节点下有 :description 字段说明该项含义
+#   - 每个节点下有 :range 字段说明值域/可选值
+#   - 实际配置值在 :value 字段
+# ============================================================
+
+# ---- 路径 -------------------------------------------------
+paths:
+  datasets_dir:
+    :description: "谱面数据集根目录"
+    :range: "任意有效路径"
+    :value: "datasets"
+
+  output_dir:
+    :description: "模型输出目录"
+    :range: "任意有效路径"
+    :value: "output"
+
+  model_dir:
+    :description: "模型权重保存目录"
+    :range: "任意有效路径"
+    :value: "checkpoints"
+
+  cache_dir:
+    :description: "预处理缓存 / EnCodec 缓存目录"
+    :range: "任意有效路径"
+    :value: "cache"
+
+# ---- 音频 Tokenizer (EnCodec) ---------------------------------
+audio:
+  model_id:
+    :description: "HuggingFace EnCodec 模型 ID"
+    :range: "facebook/encodec_24khz | facebook/encodec_48khz"
+    :value: "facebook/encodec_24khz"
+
+  premodel_path:
+    :description: "本地 EnCodec 模型目录 (离线使用时设置)"
+    :range: "premodels/encodec_24khz | 留空从 HF 下载"
+    :value: ""
+
+  num_codebooks:
+    :description: "使用的 codebook 数量 (≈带宽)。越多音质越好但 token 越多"
+    :range: "2 | 4 | 8 | 16"
+    :value: 8
+
+  device:
+    :description: "运行设备"
+    :range: "cpu | cuda"
+    :value: "cpu"
+
+  frame_rate:
+    :description: "token 帧率 (Hz)，只读，由模型决定，24kHz模型为75Hz"
+    :range: "只读"
+    :value: null
+
+# ---- 谱面 Tokenizer (Simai) ------------------------------------
+chart:
+  max_difficulty:
+    :description: "使用的最大难度编号 (1=Easy, 2=Basic, ..., 6=Re:Master, 7=UTAGE)"
+    :range: "1 ~ 7"
+    :value: 6
+
+  include_empty_measures:
+    :description: "是否在 token 序列中保留空小节占位符"
+    :range: "true | false"
+    :value: false
+
+  add_eos_token:
+    :description: "是否在序列末尾添加 <EOS> 标记"
+    :range: "true | false"
+    :value: true
+
+  target_subdiv:
+    :description: "统一的目标拍分 (所有 token 缩放到此 subdiv)。0=不缩放"
+    :range: "0 | 2 | 4 | 8 | 16"
+    :value: 4
+
+# ---- 节拍检测 (Beat Tracking) ---------------------------------
+beat:
+  method:
+    :description: "节拍检测方法"
+    :range: "librosa | beat_this | madmom"
+    :value: "librosa"
+
+  bpm_min:
+    :description: "检测 BPM 下限"
+    :range: "> 0"
+    :value: 60
+
+  bpm_max:
+    :description: "检测 BPM 上限"
+    :range: "> bpm_min"
+    :value: 240
+
+  tightness:
+    :description: "节拍紧密度 (librosa)，越高越严格"
+    :range: "0 ~ 100, 推荐 30~80"
+    :value: 50
+
+  time_signature:
+    :description: "拍号分子 (每小节几拍)"
+    :range: "3 | 4 | 5 | 6 | 7"
+    :value: 4
+
+  downbeat_weight:
+    :description: "重拍 (每小节第一拍) 的权重乘数"
+    :range: ">= 1.0"
+    :value: 1.5
+
+  quantize_beats:
+    :description: "是否将检测到的节拍量化到均匀网格"
+    :range: "true | false"
+    :value: true
+
+  use_chart_bpm:
+    :description: "是否使用谱面标注的 BPM 作为 target_bpm (推荐开启)"
+    :range: "true | false"
+    :value: true
+
+# ---- 预处理 ------------------------------------------------
+preprocess:
+  output_dir:
+    :description: "预处理结果输出目录"
+    :range: "任意有效路径"
+    :value: "preprocessed"
+
+  audio_codebooks:
+    :description: "导出音频 token 的 codebook 数量"
+    :range: "2 | 4 | 8 | 16"
+    :value: 8
+
+  beat_method:
+    :description: "节拍检测方法"
+    :range: "librosa | beat_this"
+    :value: "librosa"
+
+  beat_as_binary:
+    :description: "节拍输出为二进制信号 (True=拍点, 否则连续值)"
+    :range: "true | false"
+    :value: true
+
+  frame_rate:
+    :description: "统一时间网格帧率 (Hz), 0=自动匹配音频"
+    :range: "> 0"
+    :value: 0
+
+  max_charts:
+    :description: "最大处理谱面数 (0=全部)"
+    :range: ">= 0"
+    :value: 0
+
+  skip_existing:
+    :description: "跳过已存在的输出文件"
+    :range: "true | false"
+    :value: true
+
+# ---- 标签 ------------------------------------------------
+tags:
+  auto_tags:
+    :description: "自动添加的标签类型 (逗号分隔)"
+    :range: "designer,difficulty,dx_type,level"
+    :value: "designer,difficulty,dx_type"
+
+  auto_tags_file:
+    :description: "是否从 datasets/*/tags.txt 读取手动标签"
+    :range: "true | false"
+    :value: true
+
+  tag_vocab_path:
+    :description: "标签词汇表保存路径"
+    :range: "路径"
+    :value: "preprocessed/tag_vocab.json"
+
+  use_collections:
+    :description: "是否从 collections/*/manifest.json 读取集合标签"
+    :range: "true | false"
+    :value: true
+
+  collections_dir:
+    :description: "collections 目录路径"
+    :range: "路径"
+    :value: "collections"
+
+# ---- 数据预处理 ------------------------------------------------
+data:
+  train_split:
+    :description: "训练集比例"
+    :range: "0.0 ~ 1.0"
+    :value: 0.85
+
+  val_split:
+    :description: "验证集比例"
+    :range: "0.0 ~ 1.0, train_split + val_split <= 1.0"
+    :value: 0.10
+
+  max_audio_duration:
+    :description: "最大音频时长 (秒)，超过则截断或跳过"
+    :range: "> 0"
+    :value: 180.0
+
+  min_audio_duration:
+    :description: "最小音频时长 (秒)，短于此则跳过"
+    :range: "> 0"
+    :value: 30.0
+
+  shuffle_seed:
+    :description: "数据集随机打乱的种子"
+    :range: "任意整数"
+    :value: 42
+
+  num_workers:
+    :description: "DataLoader 工作线程数"
+    :range: ">= 0"
+    :value: 2
+
+# ---- 模型架构 ------------------------------------------------
+model:
+  model_type:
+    :description: "模型架构类型"
+    :range: "transformer | llama | custom"
+    :value: "transformer"
+
+  d_model:
+    :description: "模型隐藏层维度"
+    :range: "64 | 128 | 256 | 512 | 768 | 1024"
+    :value: 512
+
+  n_head:
+    :description: "注意力头数"
+    :range: "正整数, d_model % n_head == 0"
+    :value: 8
+
+  n_layer:
+    :description: "Transformer 层数"
+    :range: "正整数"
+    :value: 6
+
+  n_audio_codebooks:
+    :description: "音频 token 的 codebook 数量 (需与 audio.num_codebooks 一致)"
+    :range: "2 | 4 | 8 | 16"
+    :value: 8
+
+  audio_vocab_size:
+    :description: "单个音频 codebook 的词汇量"
+    :range: "正整数, 通常为 1024"
+    :value: 1024
+
+  chart_vocab_size:
+    :description: "谱面 token 词汇量 (不含 special tokens)"
+    :range: "正整数"
+    :value: 512
+
+  max_seq_len:
+    :description: "最大序列长度 (token 数)"
+    :range: "正整数"
+    :value: 8192
+
+  dropout:
+    :description: "Dropout 概率"
+    :range: "0.0 ~ 1.0"
+    :value: 0.1
+
+  use_cross_attention:
+    :description: "是否使用交叉注意力 (音频→谱面)"
+    :range: "true | false"
+    :value: true
+
+# ---- Stage 模型参数 ------------------------------------------
+stage_model:
+  d_model:
+    :description: "Transformer 隐藏维度"
+    :range: "128 | 256 | 512 | 768"
+    :value: 512
+
+  n_head:
+    :description: "注意力头数"
+    :range: "正整数"
+    :value: 8
+
+  n_layer:
+    :description: "每 Stage 的 Transformer 层数"
+    :range: "正整数"
+    :value: 6
+
+  d_ff:
+    :description: "FF 中间维度"
+    :range: "正整数"
+    :value: 2048
+
+  dropout:
+    :description: "Dropout 概率"
+    :range: "0.0 ~ 0.5"
+    :value: 0.1
+
+  hold_dur_bins:
+    :description: "Hold 持续时间离散化桶数"
+    :range: "正整数"
+    :value: 64
+
+  max_hold_slots:
+    :description: "Max hold objects inside one combined chart token"
+    :range: "positive integer"
+    :value: 8
+
+  max_slide_slots:
+    :description: "Max slide objects inside one combined chart token"
+    :range: "positive integer"
+    :value: 8
+
+  max_object_slots:
+    :description: "Max note objects inside one combined chart token"
+    :range: "positive integer"
+    :value: 16
+
+  slide_vocab_size:
+    :description: "Slide 路径词汇表最大大小"
+    :range: "正整数"
+    :value: 256
+
+# ---- 训练 ----------------------------------------------------
+training:
+  batch_size:
+    :description: "每批样本数"
+    :range: "正整数"
+    :value: 8
+
+  gradient_accumulation_steps:
+    :description: "梯度累积步数 (有效 batch = batch_size × 此值)"
+    :range: "正整数"
+    :value: 4
+
+  learning_rate:
+    :description: "初始学习率"
+    :range: "> 0, 推荐 1e-5 ~ 1e-3"
+    :value: 0.0001
+
+  min_learning_rate:
+    :description: "最低学习率 (cosine schedule 终点)"
+    :range: "> 0"
+    :value: 0.000001
+
+  warmup_steps:
+    :description: "学习率 warmup 步数"
+    :range: ">= 0"
+    :value: 1000
+
+  max_epochs:
+    :description: "最大训练轮数"
+    :range: "正整数"
+    :value: 100
+
+  optimizer:
+    :description: "优化器类型"
+    :range: "adam | adamw | sgd"
+    :value: "adamw"
+
+  weight_decay:
+    :description: "权重衰减 (L2 正则化)"
+    :range: ">= 0"
+    :value: 0.01
+
+  betas:
+    :description: "Adam/AdamW 的 beta 参数"
+    :range: "[beta1, beta2], 0 < beta < 1"
+    :value: [0.9, 0.999]
+
+  scheduler:
+    :description: "学习率调度器"
+    :range: "cosine | linear | constant"
+    :value: "cosine"
+
+  grad_clip:
+    :description: "梯度裁剪阈值"
+    :range: "> 0"
+    :value: 1.0
+
+  save_every_epochs:
+    :description: "每隔多少 epoch 保存一次 checkpoint"
+    :range: "正整数"
+    :value: 5
+
+  early_stopping_patience:
+    :description: "早停耐心 (epoch 数)，0 表示不启用"
+    :range: ">= 0"
+    :value: 20
+
+# ---- 训练循环 ------------------------------------------------
+train_loop:
+  start_stage:
+    :description: "Start training from this stage"
+    :range: "1 ~ 5"
+    :value: 1
+
+  epochs_per_stage:
+    :description: "每个 Stage 每轮训练的 epoch 数"
+    :range: "正整数"
+    :value: 5
+
+  val_samples_per_difficulty:
+    :description: "每个难度抽取的验证样本数 (不含Re:Master)"
+    :range: "正整数"
+    :value: 25
+
+  val_check_interval:
+    :description: "每隔多少 step 触发一次验证"
+    :range: "正整数"
+    :value: 200
+
+  save_best_only:
+    :description: "仅保存验证集最优的 checkpoint"
+    :range: "true | false"
+    :value: true
+
+  max_rounds:
+    :description: "最大循环轮数 (0=无限)"
+    :range: ">= 0"
+    :value: 0
+
+# ---- 日志 ----------------------------------------------------
+  max_frames:
+    :description: "Stage1 max frames per sample; 0 means full chart"
+    :range: ">= 0"
+    :value: 0
+
+  refine_max_frames:
+    :description: "Stage2-5 max frames per sample; finite window avoids T^2 attention OOM"
+    :range: ">= 0"
+    :value: 2048
+
+logging:
+  log_dir:
+    :description: "日志 / TensorBoard 目录"
+    :range: "任意有效路径"
+    :value: "logs"
+
+  log_every_steps:
+    :description: "每隔多少步打印日志"
+    :range: "正整数"
+    :value: 100
+
+  use_wandb:
+    :description: "是否使用 Weights & Biases"
+    :range: "true | false"
+    :value: false
+
+  wandb_project:
+    :description: "W&B 项目名 (use_wandb=true 时有效)"
+    :range: "字符串"
+    :value: "maiChartGen3"
+
+# ---- 生成 / 推理 ----------------------------------------------
+generation:
+  temperature:
+    :description: "采样温度 (越高越随机)"
+    :range: "> 0, 推荐 0.6 ~ 1.2"
+    :value: 0.8
+
+  top_k:
+    :description: "Top-K 采样 (0 表示不限制)"
+    :range: ">= 0"
+    :value: 50
+
+  top_p:
+    :description: "Nucleus 采样阈值 (1.0 表示不限制)"
+    :range: "0.0 ~ 1.0"
+    :value: 0.95
+
+  repetition_penalty:
+    :description: "重复惩罚系数 (> 1 减少重复)"
+    :range: ">= 1.0"
+    :value: 1.1
+
+  max_new_tokens:
+    :description: "最大生成 token 数"
+    :range: "正整数"
+    :value: 4096
+
+  do_sample:
+    :description: "是否采样 (false 则贪心解码)"
+    :range: "true | false"
+    :value: true
+
+  num_beams:
+    :description: "Beam Search 宽度 (do_sample=false 时有效)"
+    :range: "正整数"
+    :value: 1
