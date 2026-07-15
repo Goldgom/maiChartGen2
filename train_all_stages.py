@@ -369,26 +369,37 @@ def train_stage2(device="cpu", epochs=50, data_dir="preprocessed"):
 
 
 def train_stage3(device="cpu", epochs=50, data_dir="preprocessed"):
-    """Stage 3: train slide paths from preprocessed independent slide vocab targets."""
+    """Stage 3: train path+timing slide tokens from preprocessed frame_objects."""
     npz_files = sorted(Path(data_dir).glob("*.npz"))
     with open(Path(data_dir) / "vocab.json", "r", encoding="utf-8") as f:
         vocab = json.load(f)
-    slide_vocab_path = Path(data_dir) / "slide_vocab.json"
+    slide_vocab_path = Path(data_dir) / "slide_vocab_with_timing.json"
+    legacy_slide_vocab_path = Path(data_dir) / "slide_vocab.json"
     if slide_vocab_path.exists():
         with open(slide_vocab_path, "r", encoding="utf-8") as f:
             slide_vocab = json.load(f)
     else:
-        slide_vocab = {"<PAD>": 0}
+        from server_pipeline_stage3 import build_slide_vocab as build_timing_slide_vocab
+        slide_vocab = build_timing_slide_vocab(
+            "datasets",
+            str(slide_vocab_path),
+            data_dir=data_dir,
+        )
+    with open(legacy_slide_vocab_path, "w", encoding="utf-8") as f:
+        json.dump(slide_vocab, f, ensure_ascii=False, indent=2)
 
     chart_vocab_size = max(vocab.values()) + 1 if vocab else 128
     slide_vocab_size = max(slide_vocab.values()) + 1 if slide_vocab else 1
+    max_slide_slots = 8
 
     cfg = StageConfig(d_model=256, n_head=4, n_layer=3, d_ff=1024,
                       max_seq_len=2048, audio_num_codebooks=4,
                       chart_vocab_size=max(128, chart_vocab_size),
-                      slide_vocab_size=max(256, slide_vocab_size))
+                      slide_vocab_size=max(256, slide_vocab_size),
+                      max_slide_slots=max_slide_slots)
     model = Stage3SlideModel(cfg).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+    from server_pipeline_stage3 import extract_slide_frame_labels_from_preprocessed
 
     for epoch in range(epochs):
         model.train()
@@ -397,9 +408,20 @@ def train_stage3(device="cpu", epochs=50, data_dir="preprocessed"):
         for npz_path in npz_files:
             data = np.load(npz_path)
             T = min(512, data["audio_tokens"].shape[0])
-            if "slide_path_targets" not in data:
-                continue
-            slide_np = data["slide_path_targets"][:T].astype(np.int64)
+            frame_labels, _ = extract_slide_frame_labels_from_preprocessed(
+                npz_path.with_suffix(".json"),
+                slide_vocab,
+            )
+            slide_np = np.zeros((T, max_slide_slots), dtype=np.int64)
+            for frame, token_ids in frame_labels.items():
+                if frame < 0 or frame >= T:
+                    continue
+                for slot, tid in enumerate(token_ids[:max_slide_slots]):
+                    slide_np[frame, slot] = int(tid)
+            if slide_np.sum() == 0 and "slide_path_targets" in data:
+                slide_np = data["slide_path_targets"][:T].astype(np.int64)
+                if slide_np.ndim == 1:
+                    slide_np = slide_np[:, None]
             if slide_np.sum() == 0:
                 continue
 

@@ -11,7 +11,7 @@ train_loop.py — 全流程预处理 + 5-Stage 无限循环训练
 配置: Config/default.yaml
 """
 
-import json, time, signal, sys
+import json, math, time, signal, sys
 from pathlib import Path
 from collections import defaultdict
 
@@ -120,6 +120,7 @@ def load_and_split_data(cfg):
         val_files.extend(picked)
         log(f"  {diff}: {len(picked)} val / {len(files)} total")
 
+    rng.shuffle(val_files)
     val_set = {str(f) for f in val_files}
     train_files = [f for f in all_files if str(f) not in val_set]
     log(f"Train: {len(train_files)}, Val: {len(val_files)}")
@@ -147,9 +148,14 @@ def preprocess_all(cfg):
 
 
 class ChartDataset(torch.utils.data.Dataset):
-    def __init__(self, files, max_frames=0):
+    def __init__(self, files, max_frames=0, slide_vocab=None, max_slide_slots=8,
+                 random_crop=True):
         self.files = files
         self.max_frames = max_frames
+        self.use_timing_slide = slide_vocab is not None
+        self.slide_vocab = slide_vocab or {"<PAD>": 0}
+        self.max_slide_slots = max_slide_slots
+        self.random_crop = random_crop
         self.diff_map = {
             "Easy": 0,
             "Basic": 1,
@@ -170,8 +176,19 @@ class ChartDataset(torch.utils.data.Dataset):
         meta = json.loads(meta_path.read_text("utf-8")) if meta_path.exists() else {"metadata": {}}
         metadata = meta.get("metadata", {})
         T = data["audio_tokens"].shape[0]
+        frame_labels = None
         if self.max_frames and self.max_frames > 0 and T > self.max_frames:
-            start = np.random.randint(0, T - self.max_frames + 1)
+            if self.random_crop:
+                start = np.random.randint(0, T - self.max_frames + 1)
+            elif self.use_timing_slide:
+                frame_labels = self._extract_slide_frame_labels(meta_path)
+                if frame_labels:
+                    first_slide = min(frame_labels)
+                    start = max(0, min(T - self.max_frames, first_slide - self.max_frames // 2))
+                else:
+                    start = 0
+            else:
+                start = 0
             end = start + self.max_frames
         else:
             start = 0
@@ -181,6 +198,13 @@ class ChartDataset(torch.utils.data.Dataset):
         n_tags = min(len(tag_ids), len(padded_tags))
         padded_tags[:n_tags] = tag_ids[:n_tags]
         diff_name = metadata.get("difficulty_name", "Expert")
+        slide_path_targets = self._load_slide_targets(
+            meta_path=meta_path,
+            fallback=data.get("slide_path_targets", np.zeros(T, dtype=np.int32)),
+            start=start,
+            end=end,
+            frame_labels=frame_labels,
+        )
         return {
             "audio": data["audio_tokens"][start:end].astype(np.int64),
             "beat": data["beat_signal"][start:end].astype(np.float32),
@@ -189,11 +213,46 @@ class ChartDataset(torch.utils.data.Dataset):
             "ex_mask": data.get("ex_mask", np.zeros(T, dtype=bool))[start:end],
             "object_mask": data.get("object_mask", np.zeros(T, dtype=bool))[start:end],
             "hold_dur_targets": data.get("hold_dur_targets", np.zeros(T, dtype=np.int32))[start:end],
-            "slide_path_targets": data.get("slide_path_targets", np.zeros(T, dtype=np.int32))[start:end],
+            "slide_path_targets": slide_path_targets,
             "difficulty": np.array(self.diff_map.get(diff_name, 3), dtype=np.int64),
             "level": np.array(float(metadata.get("level", 10.0)), dtype=np.float32),
             "tags": padded_tags,
         }
+
+    def _extract_slide_frame_labels(self, meta_path):
+        try:
+            from server_pipeline_stage3 import extract_slide_frame_labels_from_preprocessed
+            frame_labels, _ = extract_slide_frame_labels_from_preprocessed(meta_path, self.slide_vocab)
+        except Exception:
+            frame_labels = {}
+        return frame_labels
+
+    def _load_slide_targets(self, meta_path, fallback, start, end, frame_labels=None):
+        """Build path+timing slide targets from frame_objects for Stage3."""
+        if not self.use_timing_slide:
+            fallback = fallback[start:end].astype(np.int32)
+            if fallback.ndim == 1:
+                fallback = fallback[:, None]
+            return fallback
+
+        if frame_labels is None:
+            frame_labels = self._extract_slide_frame_labels(meta_path)
+
+        length = end - start
+        if frame_labels:
+            targets = np.zeros((length, self.max_slide_slots), dtype=np.int32)
+            for abs_frame, token_ids in frame_labels.items():
+                if abs_frame < start or abs_frame >= end:
+                    continue
+                rel_frame = abs_frame - start
+                for slot, tid in enumerate(token_ids[:self.max_slide_slots]):
+                    targets[rel_frame, slot] = int(tid)
+            return targets
+
+        fallback = fallback[start:end].astype(np.int32)
+        if fallback.ndim == 1:
+            fallback = fallback[:, None]
+        return fallback
 
 
 def collate(batch):
@@ -277,15 +336,24 @@ class Trainer:
         self.data_dir.mkdir(parents=True, exist_ok=True)
         with open(self.data_dir / "vocab.json", "r", encoding="utf-8") as f:
             self.vocab = json.load(f)
-        slide_vocab_path = self.data_dir / "slide_vocab.json"
+        slide_vocab_path = self.data_dir / "slide_vocab_with_timing.json"
+        if not slide_vocab_path.exists():
+            slide_vocab_path = self.data_dir / "slide_vocab.json"
         if slide_vocab_path.exists():
             with open(slide_vocab_path, "r", encoding="utf-8") as f:
                 self.slide_vocab = json.load(f)
         else:
             self.slide_vocab = {"<PAD>": 0}
+        tag_vocab_path = self.data_dir / "tag_vocab.json"
+        if tag_vocab_path.exists():
+            with open(tag_vocab_path, "r", encoding="utf-8") as f:
+                self.tag_vocab = json.load(f)
+        else:
+            self.tag_vocab = {}
         # 实际 vocab 大小 (至少 +1 给 0=padding/no-note)
         self.actual_vocab_size = max(self.vocab.values()) + 1
         self.actual_slide_vocab_size = max(self.slide_vocab.values()) + 1
+        self.actual_tag_vocab_size = max(self.tag_vocab.values()) + 1 if self.tag_vocab else 1
         log(f"实际 chart vocab 大小: {self.actual_vocab_size} "
             f"(配置: {self.cfg.model.chart_vocab_size})")
 
@@ -298,15 +366,22 @@ class Trainer:
         chart_vs = max(getattr(self, 'actual_vocab_size', 256),
                        self.cfg.model.chart_vocab_size)
         log(f"  Stage {stage} model: type={getattr(sc, 'model_type', 'transformer')} "
-            f"d_model={sc.d_model} n_layer={sc.n_layer} n_head={sc.n_head} d_ff={sc.d_ff}")
+            f"d_model={sc.d_model} n_layer={sc.n_layer} n_head={sc.n_head} "
+            f"d_ff={sc.d_ff} slot_n_layer={getattr(sc, 'slot_n_layer', 2)} "
+            f"tag_scale={getattr(sc, 'global_tag_scale', 1.0)}/"
+            f"{getattr(sc, 'dynamic_tag_scale', 1.0)}")
         mcfg = StageConfig(
             d_model=sc.d_model, n_head=sc.n_head, n_layer=sc.n_layer,
             d_ff=sc.d_ff, dropout=sc.dropout,
             max_seq_len=self.cfg.model.max_seq_len, audio_num_codebooks=self.cfg.audio.num_codebooks,
+            tag_vocab_size=max(getattr(self, "actual_tag_vocab_size", 1), 1),
             chart_vocab_size=chart_vs, hold_dur_bins=sc.hold_dur_bins,
             max_hold_slots=getattr(sc, "max_hold_slots", 8),
             max_slide_slots=getattr(sc, "max_slide_slots", 8),
             max_object_slots=getattr(sc, "max_object_slots", 16),
+            slot_n_layer=getattr(sc, "slot_n_layer", 2),
+            global_tag_scale=getattr(sc, "global_tag_scale", 1.0),
+            dynamic_tag_scale=getattr(sc, "dynamic_tag_scale", 1.0),
             slide_vocab_size=max(sc.slide_vocab_size, getattr(self, "actual_slide_vocab_size", 1)),
         )
         if stage == 1:
@@ -326,13 +401,118 @@ class Trainer:
             return Stage5ExModel(mcfg).to(self.device)
 
     def _load_or_build(self, stage: int):
-        path = self.ckpt_dir / f"stage{stage}_best.pt"
+        last_path = self.ckpt_dir / f"stage{stage}_last.pt"
+        best_path = self.ckpt_dir / f"stage{stage}_best.pt"
+        path = last_path if last_path.exists() else best_path
         model = self._build_model(stage)
         if path.exists():
             ckpt = torch.load(path, map_location=self.device, weights_only=False)
-            model.load_state_dict(ckpt.get("model_state_dict", ckpt.get("model", {})))
-            log(f"  Stage {stage}: 加载已有 checkpoint")
+            if "val_loss" in ckpt and path == best_path:
+                self.best_val_loss[f"stage{stage}"] = min(
+                    self.best_val_loss[f"stage{stage}"],
+                    float(ckpt["val_loss"]),
+                )
+            if "global_step" in ckpt:
+                self.global_step = max(self.global_step, int(ckpt["global_step"]))
+            state = ckpt.get("model_state_dict", ckpt.get("model", {}))
+            loaded, skipped = self._load_compatible_state(model, state)
+            msg = f"  Stage {stage}: 从 {path.name} 接续 ({loaded} tensors)"
+            if skipped:
+                msg += f", 跳过 {len(skipped)} 个 shape 不匹配参数: {', '.join(skipped[:6])}"
+                if len(skipped) > 6:
+                    msg += ", ..."
+            log(msg)
         return model
+
+    def _load_compatible_state(self, model, state: dict) -> tuple[int, list[str]]:
+        """Load matching tensors and keep resized heads/embeddings initialized."""
+        current = model.state_dict()
+        compatible = {}
+        skipped = []
+        for name, tensor in state.items():
+            if name not in current:
+                skipped.append(name)
+                continue
+            if current[name].shape != tensor.shape:
+                skipped.append(name)
+                continue
+            compatible[name] = tensor
+        current.update(compatible)
+        model.load_state_dict(current)
+        return len(compatible), skipped
+
+    def _load_best_losses(self) -> None:
+        for stage in range(1, 6):
+            path = self.ckpt_dir / f"stage{stage}_best.pt"
+            if not path.exists():
+                continue
+            try:
+                ckpt = torch.load(path, map_location="cpu", weights_only=False)
+            except Exception:
+                continue
+            if "val_loss" in ckpt:
+                self.best_val_loss[f"stage{stage}"] = float(ckpt["val_loss"])
+
+    def _training_cfg(self, stage: int):
+        return getattr(self.cfg, f"stage{stage}_training", self.cfg.training)
+
+    def _build_optimizer(self, model, tcfg=None):
+        tcfg = tcfg or self.cfg.training
+        opt_name = str(getattr(tcfg, "optimizer", "adamw")).lower()
+        lr = float(getattr(tcfg, "learning_rate", 1e-4))
+        weight_decay = float(getattr(tcfg, "weight_decay", 0.0))
+        betas = tuple(getattr(tcfg, "betas", [0.9, 0.999]))
+
+        if opt_name == "adamw":
+            return torch.optim.AdamW(
+                model.parameters(),
+                lr=lr,
+                weight_decay=weight_decay,
+                betas=betas,
+            )
+        if opt_name == "adam":
+            return torch.optim.Adam(
+                model.parameters(),
+                lr=lr,
+                weight_decay=weight_decay,
+                betas=betas,
+            )
+        if opt_name == "sgd":
+            return torch.optim.SGD(
+                model.parameters(),
+                lr=lr,
+                weight_decay=weight_decay,
+                momentum=0.9,
+            )
+        raise ValueError(f"Unsupported optimizer: {opt_name}")
+
+    def _build_scheduler(self, optimizer, total_update_steps: int, tcfg=None):
+        tcfg = tcfg or self.cfg.training
+        name = str(getattr(tcfg, "scheduler", "cosine")).lower()
+        warmup_steps = max(0, int(getattr(tcfg, "warmup_steps", 0)))
+        base_lr = float(getattr(tcfg, "learning_rate", 1e-4))
+        min_lr = float(getattr(tcfg, "min_learning_rate", 0.0))
+        min_ratio = min(max(min_lr / base_lr, 0.0), 1.0) if base_lr > 0 else 0.0
+        total_update_steps = max(1, int(total_update_steps))
+
+        def lr_lambda(step: int) -> float:
+            if warmup_steps > 0 and step < warmup_steps:
+                return max(min_ratio, float(step + 1) / float(warmup_steps))
+            if name == "constant":
+                return 1.0
+            denom = max(1, total_update_steps - warmup_steps)
+            progress = min(1.0, max(0.0, (step - warmup_steps) / denom))
+            if name == "linear":
+                return min_ratio + (1.0 - min_ratio) * (1.0 - progress)
+            if name == "cosine":
+                cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+                return min_ratio + (1.0 - min_ratio) * cosine
+            raise ValueError(f"Unsupported scheduler: {name}")
+
+        return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
+    def _current_lr(self, optimizer) -> float:
+        return float(optimizer.param_groups[0].get("lr", 0.0))
 
     def compute_loss(self, model, batch, stage: int):
         audio, beat, chart, brk, ex, obj_mask, hold_dur, slide_path, diff, lvl, tags, valid = [x.to(self.device) for x in batch]
@@ -377,30 +557,47 @@ class Trainer:
                          ex_targets=ex,
                          note_mask=obj_mask)["loss"]
 
-    def save(self, model, stage: int, val_loss: float):
-        path = self.ckpt_dir / f"stage{stage}_best.pt"
+    def _checkpoint_payload(self, model, stage: int, val_loss: float | None = None) -> dict:
         ckpt = {
             "model_state_dict": model.state_dict(),
             "model": model.state_dict(),  # backward-compatible alias
             "config": model.cfg,
             "cfg": model.cfg,             # backward-compatible alias
             "stage": stage,
-            "val_loss": val_loss,
             "global_step": self.global_step,
         }
+        if val_loss is not None:
+            ckpt["val_loss"] = val_loss
         if stage == 3:
             ckpt["slide_vocab"] = getattr(self, "slide_vocab", {"<PAD>": 0})
+        return ckpt
+
+    def save_best(self, model, stage: int, val_loss: float):
+        path = self.ckpt_dir / f"stage{stage}_best.pt"
+        ckpt = self._checkpoint_payload(model, stage, val_loss)
         torch.save(ckpt, path)
         self.best_val_loss[f"stage{stage}"] = val_loss
         log(f"  -> saved stage{stage}_best.pt (val_loss={val_loss:.4f})")
+
+    def save_last(self, model, stage: int, val_loss: float | None = None):
+        path = self.ckpt_dir / f"stage{stage}_last.pt"
+        ckpt = self._checkpoint_payload(model, stage, val_loss)
+        torch.save(ckpt, path)
+        if val_loss is None:
+            log(f"  -> saved stage{stage}_last.pt")
+        else:
+            log(f"  -> saved stage{stage}_last.pt (val_loss={val_loss:.4f})")
 
     def run(self):
         global _should_stop
         train_files, val_files = load_and_split_data(self.cfg)
         self._init_data()
+        self._load_best_losses()
         stage1_max_frames = getattr(self.cfg.train_loop, "max_frames", 0)
         refine_max_frames = getattr(self.cfg.train_loop, "refine_max_frames", 2048)
         start_stage = max(1, min(5, int(getattr(self.cfg.train_loop, "start_stage", 1))))
+        train_mode = getattr(self.cfg.train_loop, "mode", "stage_epochs")
+        round_robin = train_mode == "round_robin"
         round_num = 0
         max_rounds = self.cfg.train_loop.max_rounds
 
@@ -408,6 +605,7 @@ class Trainer:
             round_num += 1
             log(f"\n{'='*60}")
             log(f"Round {round_num}" + (f"/{max_rounds}" if max_rounds > 0 else ""))
+            log(f"Mode: {train_mode}")
             log(f"Stages: {start_stage}-5")
             log(f"{'='*60}")
 
@@ -416,49 +614,113 @@ class Trainer:
                     break
                 log(f"\n--- Stage {stage} ---")
                 model = self._load_or_build(stage)
-                optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, weight_decay=0.01)
+                tcfg = self._training_cfg(stage)
+                optimizer = self._build_optimizer(model, tcfg)
                 stage_max_frames = stage1_max_frames if stage == 1 else refine_max_frames
                 log(f"  max_frames={stage_max_frames} ({'full chart' if stage_max_frames == 0 else 'windowed'})")
-                val_ds = ChartDataset(val_files, max_frames=stage_max_frames)
-                val_loader = torch.utils.data.DataLoader(val_ds, batch_size=2, shuffle=False, collate_fn=collate)
+                max_slide_slots = getattr(getattr(self.cfg, "stage3_model", self.cfg.stage_model), "max_slide_slots", 8)
+                batch_size = max(1, int(getattr(tcfg, "batch_size", 2)))
+                grad_accum = max(1, int(getattr(tcfg, "gradient_accumulation_steps", 1)))
+                grad_clip = float(getattr(tcfg, "grad_clip", 0.0))
+                num_workers = max(0, int(getattr(self.cfg.data, "num_workers", 0)))
+                val_ds = ChartDataset(
+                    val_files,
+                    max_frames=stage_max_frames,
+                    slide_vocab=self.slide_vocab if stage == 3 else None,
+                    max_slide_slots=max_slide_slots,
+                    random_crop=False,
+                )
+                val_loader = torch.utils.data.DataLoader(
+                    val_ds,
+                    batch_size=batch_size,
+                    shuffle=False,
+                    collate_fn=collate,
+                    num_workers=num_workers,
+                    pin_memory=self.device == "cuda",
+                )
                 self._val_loader = val_loader
-                train_ds = ChartDataset(train_files, max_frames=stage_max_frames)
-                train_loader = torch.utils.data.DataLoader(train_ds, batch_size=2, shuffle=True, collate_fn=collate)
-                epochs = self.cfg.train_loop.epochs_per_stage
-                val_interval = self.cfg.train_loop.val_check_interval
+                train_ds = ChartDataset(
+                    train_files,
+                    max_frames=stage_max_frames,
+                    slide_vocab=self.slide_vocab if stage == 3 else None,
+                    max_slide_slots=max_slide_slots,
+                    random_crop=True,
+                )
+                train_loader = torch.utils.data.DataLoader(
+                    train_ds,
+                    batch_size=batch_size,
+                    shuffle=True,
+                    collate_fn=collate,
+                    num_workers=num_workers,
+                    pin_memory=self.device == "cuda",
+                )
+                epochs = 1 if round_robin else self.cfg.train_loop.epochs_per_stage
+                max_epochs = max(1, int(getattr(tcfg, "max_epochs", epochs)))
+                epochs = max(1, min(int(epochs), max_epochs))
+                val_interval = max(1, int(self.cfg.train_loop.val_check_interval))
+                total_updates = epochs * max(1, math.ceil(len(train_loader) / grad_accum))
+                scheduler = self._build_scheduler(optimizer, total_updates, tcfg)
+                log_every = max(1, int(getattr(self.cfg.logging, "log_every_steps", 50)))
+                log(
+                    f"  train: batch={batch_size} accum={grad_accum} "
+                    f"effective_batch={batch_size * grad_accum} optimizer={tcfg.optimizer} "
+                    f"lr={tcfg.learning_rate:.2e} scheduler={tcfg.scheduler} "
+                    f"warmup={tcfg.warmup_steps} min_lr={tcfg.min_learning_rate:.2e} "
+                    f"weight_decay={tcfg.weight_decay} grad_clip={grad_clip}"
+                )
                 t0 = time.time(); steps = 0
 
                 for epoch in range(epochs):
                     if _should_stop: break
                     model.train(); epoch_loss = 0.0; n_steps = 0; t_epoch = time.time()
+                    accum_steps = 0
+                    optimizer.zero_grad(set_to_none=True)
                     for batch in train_loader:
                         if _should_stop: break
                         loss = self.compute_loss(model, batch, stage)
                         if loss is None: continue
-                        optimizer.zero_grad()
-                        loss.backward()
-                        nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                        optimizer.step()
+                        (loss / grad_accum).backward()
                         epoch_loss += loss.item(); n_steps += 1
                         self.global_step += 1; steps += 1
-                        if steps % 50 == 0:
+                        accum_steps += 1
+                        if accum_steps % grad_accum == 0:
+                            if grad_clip > 0:
+                                nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+                            optimizer.step()
+                            scheduler.step()
+                            optimizer.zero_grad(set_to_none=True)
+                        if steps % log_every == 0:
                             avg_l = epoch_loss / max(n_steps, 1)
                             sys_i = _monitor.fmt()
                             log(f"  s{steps:5d} loss={avg_l:.4f} "
+                                f"lr={self._current_lr(optimizer):.2e} "
                                 f"{n_steps/(time.time()-t_epoch):.1f}stp/s {sys_i}")
                         if steps > 0 and steps % val_interval == 0:
                             model.eval()
                             vloss = self.validate(model, self._val_loader, stage)
                             if vloss < self.best_val_loss[f"stage{stage}"]:
-                                self.save(model, stage, vloss)
+                                self.save_best(model, stage, vloss)
                             model.train()
+                    if accum_steps % grad_accum != 0:
+                        if grad_clip > 0:
+                            nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+                        optimizer.step()
+                        scheduler.step()
+                        optimizer.zero_grad(set_to_none=True)
                     avg = epoch_loss / max(n_steps, 1)
-                    log(f"  E{epoch+1}/{epochs} loss={avg:.4f} steps={n_steps} {time.time()-t0:.0f}s")
+                    log(
+                        f"  E{epoch+1}/{epochs} loss={avg:.4f} steps={n_steps} "
+                        f"lr={self._current_lr(optimizer):.2e} {time.time()-t0:.0f}s"
+                    )
+                    self.save_last(model, stage)
+                    if _should_stop:
+                        break
 
                 model.eval()
                 vloss = self.validate(model, self._val_loader, stage)
                 if vloss < self.best_val_loss[f"stage{stage}"]:
-                    self.save(model, stage, vloss)
+                    self.save_best(model, stage, vloss)
+                self.save_last(model, stage, vloss)
                 log(f"  Stage {stage} done, val_loss={vloss:.4f}")
 
             if max_rounds > 0 and round_num >= max_rounds:
@@ -475,8 +737,6 @@ class Trainer:
             loss = self.compute_loss(model, batch, stage)
             if loss is not None:
                 total += loss.item(); n += 1
-            if n >= 10:  # 限制验证批次数
-                break
         return total / max(n, 1)
 
 
@@ -491,6 +751,10 @@ if __name__ == "__main__":
                         help="配置文件 (如 server_4090), 默认使用 default")
     parser.add_argument("--start-stage", type=int, default=None,
                         help="Start training from this stage (1-5), overriding config")
+    parser.add_argument("--mode", choices=("stage_epochs", "round_robin"), default=None,
+                        help="Training loop mode. round_robin trains each stage for one epoch per round.")
+    parser.add_argument("--round-robin", action="store_true",
+                        help="Shortcut for --mode round_robin")
     args = parser.parse_args()
 
     if not Path("Config/default.yaml").exists():
@@ -500,6 +764,10 @@ if __name__ == "__main__":
         if not (1 <= args.start_stage <= 5):
             parser.error("--start-stage must be in [1, 5]")
         cfg.train_loop.start_stage = args.start_stage
+    if args.mode is not None:
+        cfg.train_loop.mode = args.mode
+    if args.round_robin:
+        cfg.train_loop.mode = "round_robin"
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     log_dir = Path(cfg.logging.log_dir)
@@ -512,7 +780,8 @@ if __name__ == "__main__":
         sc = getattr(cfg, f"stage{i}_model")
         stage_summaries.append(f"s{i}:d{sc.d_model}/l{sc.n_layer}/h{sc.n_head}")
     log("stage_models=" + " ".join(stage_summaries))
-    log(f"start_stage={cfg.train_loop.start_stage} epochs/stage={cfg.train_loop.epochs_per_stage} val_interval={cfg.train_loop.val_check_interval}")
+    log(f"mode={cfg.train_loop.mode} start_stage={cfg.train_loop.start_stage} "
+        f"epochs/stage={cfg.train_loop.epochs_per_stage} val_interval={cfg.train_loop.val_check_interval}")
     log(f"ckpt_dir={cfg.paths.model_dir}")
 
     try:

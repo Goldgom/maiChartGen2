@@ -38,6 +38,7 @@ class PathsConfig:
 
 @dataclass
 class TrainLoopConfig:
+    mode: str = "stage_epochs"
     start_stage: int = 1
     epochs_per_stage: int = 5
     val_samples_per_difficulty: int = 25
@@ -169,6 +170,9 @@ class StageModelConfig:
     max_hold_slots: int = 8
     max_slide_slots: int = 8
     max_object_slots: int = 16
+    slot_n_layer: int = 2
+    global_tag_scale: float = 1.0
+    dynamic_tag_scale: float = 1.0
     slide_vocab_size: int = 256
 
 
@@ -185,6 +189,11 @@ class Config:
     data: DataConfig = field(default_factory=DataConfig)
     model: ModelConfig = field(default_factory=ModelConfig)
     training: TrainingConfig = field(default_factory=TrainingConfig)
+    stage1_training: TrainingConfig = field(default_factory=TrainingConfig)
+    stage2_training: TrainingConfig = field(default_factory=TrainingConfig)
+    stage3_training: TrainingConfig = field(default_factory=TrainingConfig)
+    stage4_training: TrainingConfig = field(default_factory=TrainingConfig)
+    stage5_training: TrainingConfig = field(default_factory=TrainingConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
     generation: GenerationConfig = field(default_factory=GenerationConfig)
     stage_model: StageModelConfig = field(default_factory=StageModelConfig)
@@ -245,8 +254,24 @@ class Config:
             errors.append("max_audio_duration 必须大于 min_audio_duration")
         if self.training.learning_rate <= 0:
             errors.append("learning_rate 必须 > 0")
+        for idx in range(1, 6):
+            tc = getattr(self, f"stage{idx}_training")
+            if tc.batch_size <= 0:
+                errors.append(f"stage{idx}_training.batch_size 必须 > 0")
+            if tc.gradient_accumulation_steps <= 0:
+                errors.append(f"stage{idx}_training.gradient_accumulation_steps 必须 > 0")
+            if tc.learning_rate <= 0:
+                errors.append(f"stage{idx}_training.learning_rate 必须 > 0")
+            if tc.min_learning_rate < 0:
+                errors.append(f"stage{idx}_training.min_learning_rate 必须 >= 0")
+            if str(tc.scheduler).lower() not in ("cosine", "linear", "constant"):
+                errors.append(f"stage{idx}_training.scheduler must be cosine, linear, or constant")
+            if str(tc.optimizer).lower() not in ("adam", "adamw", "sgd"):
+                errors.append(f"stage{idx}_training.optimizer must be adam, adamw, or sgd")
         if not (1 <= self.train_loop.start_stage <= 5):
             errors.append(f"train_loop.start_stage({self.train_loop.start_stage}) must be in [1, 5]")
+        if self.train_loop.mode not in ("stage_epochs", "round_robin"):
+            errors.append("train_loop.mode must be 'stage_epochs' or 'round_robin'")
         if self.generation.temperature <= 0:
             errors.append("temperature 必须 > 0")
         if self.generation.top_p < 0 or self.generation.top_p > 1.0:
@@ -258,8 +283,10 @@ class Config:
         """多行摘要"""
         lines = [f"Config: {self.config_name or '(unnamed)'}"]
         for section_name in ["paths", "audio", "chart", "beat", "preprocess", "tags", "train_loop", "data", "model",
-                              "training", "logging", "generation", "stage_model", "stage1_model", "stage2_model",
-                              "stage3_model", "stage4_model", "stage5_model"]:
+                              "training", "stage1_training", "stage2_training", "stage3_training",
+                              "stage4_training", "stage5_training", "logging", "generation",
+                              "stage_model", "stage1_model", "stage2_model", "stage3_model",
+                              "stage4_model", "stage5_model"]:
             section = getattr(self, section_name)
             lines.append(f"  [{section_name}]")
             for f in fields(section):
@@ -430,9 +457,13 @@ class ConfigLoader:
             return result
 
         base_stage_raw = values.get("stage_model", {})
+        base_training_raw = values.get("training", {})
 
         def _stage_values(name: str) -> dict:
             return ConfigLoader._deep_merge(base_stage_raw, values.get(name, {}))
+
+        def _stage_training_values(name: str) -> dict:
+            return ConfigLoader._deep_merge(base_training_raw, values.get(name, {}))
 
         return Config(
             paths=PathsConfig(**_coerce(PathsConfig, values.get("paths", {}))),
@@ -445,6 +476,11 @@ class ConfigLoader:
             data=DataConfig(**_coerce(DataConfig, values.get("data", {}))),
             model=ModelConfig(**_coerce(ModelConfig, values.get("model", {}))),
             training=TrainingConfig(**_coerce(TrainingConfig, values.get("training", {}))),
+            stage1_training=TrainingConfig(**_coerce(TrainingConfig, _stage_training_values("stage1_training"))),
+            stage2_training=TrainingConfig(**_coerce(TrainingConfig, _stage_training_values("stage2_training"))),
+            stage3_training=TrainingConfig(**_coerce(TrainingConfig, _stage_training_values("stage3_training"))),
+            stage4_training=TrainingConfig(**_coerce(TrainingConfig, _stage_training_values("stage4_training"))),
+            stage5_training=TrainingConfig(**_coerce(TrainingConfig, _stage_training_values("stage5_training"))),
             logging=LoggingConfig(**_coerce(LoggingConfig, values.get("logging", {}))),
             generation=GenerationConfig(**_coerce(GenerationConfig, values.get("generation", {}))),
             stage_model=StageModelConfig(**_coerce(StageModelConfig, base_stage_raw)),

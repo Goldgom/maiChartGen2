@@ -20,7 +20,7 @@ import torch.nn.functional as F
 
 from models.common import (
     StageConfig, AudioEncoder, ConditionEmbedding,
-    make_model, build_causal_mask,
+    ChartAudioFusion, make_model, build_causal_mask,
 )
 
 
@@ -34,6 +34,7 @@ class Stage5ExModel(nn.Module):
         self.audio_encoder = AudioEncoder(cfg)
         self.cond_embed = ConditionEmbedding(cfg)
         self.chart_embed = nn.Embedding(cfg.chart_vocab_size, cfg.d_model)
+        self.chart_fusion = ChartAudioFusion(cfg)
 
         self.layers = make_model(cfg, cfg.n_layer, cross_attn=True)
 
@@ -57,8 +58,15 @@ class Stage5ExModel(nn.Module):
         device = audio_tokens.device
 
         audio_feat = self.audio_encoder(audio_tokens)
-        cond = self.cond_embed(beat_signal, difficulty, level, tag_ids)
-        x = self.chart_embed(stage4_chart.long()) + cond
+        chart_x = self.chart_embed(stage4_chart.long())
+        cond = self.cond_embed(
+            beat_signal,
+            difficulty,
+            level,
+            tag_ids,
+            frame_query=chart_x,
+        )
+        x = self.chart_fusion(chart_x, audio_feat, cond)
 
         causal_mask = build_causal_mask(T, device)
         for layer in self.layers:

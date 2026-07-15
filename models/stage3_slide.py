@@ -6,15 +6,16 @@ models/stage3_slide.py — Stage 3: 自回归补全 Slide 路径
   - audio_tokens/beat/difficulty/level/tags
 
 输出:
-  - slide_path_logits: (B, T, S_vocab)  slide 路径 token logits
+  - slide_path_logits: (B, T, S, S_vocab)  slide 路径 token logits
 
 Slide 路径独立编码:
   - 每种不同的 slide 路径 (如 "-4", ">5-8", "V28", "*V28") 映射为独立的 token
-  - 多段 slide 拆分为多个 token 自回归生成: "-4" 后跟结束符, 或 ">5" 后跟 "-8" 后跟结束符
+  - 同一帧多个 slide/timing token 按 slot 序列建模
 
 训练:
   - 仅 slide 位置计算 loss
-  - Causal mask, 自回归生成路径 token
+  - 时间维度使用 causal mask
+  - slot 维度使用 causal transformer 建模同帧多 token 关系
 """
 
 import torch
@@ -23,7 +24,7 @@ import torch.nn.functional as F
 
 from models.common import (
     StageConfig, AudioEncoder, ConditionEmbedding,
-    make_model, build_causal_mask,
+    ChartAudioFusion, make_model, build_causal_mask, _init_weights,
 )
 
 
@@ -43,14 +44,20 @@ class Stage3SlideModel(nn.Module):
         self.audio_encoder = AudioEncoder(cfg)
         self.cond_embed = ConditionEmbedding(cfg)
         self.chart_embed = nn.Embedding(cfg.chart_vocab_size, cfg.d_model)
+        self.chart_fusion = ChartAudioFusion(cfg)
 
         self.layers = make_model(cfg, cfg.n_layer, cross_attn=True)
 
         self.ln_final = nn.LayerNorm(cfg.d_model)
         self.max_slide_slots = getattr(cfg, "max_slide_slots", 8)
         self.slot_embed = nn.Embedding(self.max_slide_slots, cfg.d_model)
-        # 每个 slide 位置输出多个路径 token (自回归)
+        slot_layers = max(1, int(getattr(cfg, "slot_n_layer", 2)))
+        self.slot_layers = make_model(cfg, slot_layers, cross_attn=False)
+        self.slot_ln = nn.LayerNorm(cfg.d_model)
+        # 每个 slide 位置输出多个路径+timing token
         self.head = nn.Linear(cfg.d_model, cfg.slide_vocab_size)
+        for module in [self.chart_embed, self.ln_final, self.slot_embed, self.slot_ln, self.head]:
+            module.apply(lambda m: _init_weights(m, cfg.init_std))
 
     def forward(
         self,
@@ -68,33 +75,44 @@ class Stage3SlideModel(nn.Module):
           - 0 = padding (该帧非 slide, 或路径结束)
           - >0 = 路径 segment token ID
 
-        训练时对 slide 位置的每个路径 token 自回归预测。
+        训练时对 slide 位置的每个路径+timing token 计算 loss。
         """
         B, T, _ = audio_tokens.shape
         device = audio_tokens.device
 
         # 1. 音频 + 条件
         audio_feat = self.audio_encoder(audio_tokens)
-        cond = self.cond_embed(beat_signal, difficulty, level, tag_ids)
-
-        # 2. 谱面嵌入
-        x = self.chart_embed(stage2_chart.long()) + cond
+        # 2. 谱面嵌入 + 位置编码 + 同帧音频依赖 + 条件
+        chart_x = self.chart_embed(stage2_chart.long())
+        cond = self.cond_embed(
+            beat_signal,
+            difficulty,
+            level,
+            tag_ids,
+            frame_query=chart_x,
+        )
+        x = self.chart_fusion(chart_x, audio_feat, cond)
 
         # 3. Causal transformer
         causal_mask = build_causal_mask(T, device)
         for layer in self.layers:
             x = layer(x, memory=audio_feat, causal_mask=causal_mask)
 
-        # 4. Slide 路径预测 (每帧一个 logits 向量, 代表第一个路径 token)
+        # 4. Slide 路径预测: 对每一帧内部的 slot 序列做短程因果建模。
         x = self.ln_final(x)
         slot_ids = torch.arange(self.max_slide_slots, device=device)
         slot_x = x.unsqueeze(2) + self.slot_embed(slot_ids).view(1, 1, self.max_slide_slots, -1)
+        slot_x = slot_x.reshape(B * T, self.max_slide_slots, -1)
+        slot_mask = build_causal_mask(self.max_slide_slots, device)
+        for layer in self.slot_layers:
+            slot_x = layer(slot_x, causal_mask=slot_mask)
+        slot_x = self.slot_ln(slot_x).reshape(B, T, self.max_slide_slots, -1)
         logits = self.head(slot_x)  # (B, T, S, V_slide)
 
         result = {"logits": logits, "frame_logits": logits[:, :, 0, :]}
 
         if slide_path_targets is not None and slide_mask is not None:
-            # 只在 slide 位置对第一个路径 token 计算 loss
+            # 只在存在 slide token 的 slot 上计算 loss。
             if slide_path_targets.dim() == 2:
                 slide_path_targets = slide_path_targets.unsqueeze(-1)
             if slide_mask.dim() == 2:

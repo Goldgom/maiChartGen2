@@ -46,6 +46,9 @@ class StageConfig:
     max_hold_slots: int = 8
     max_slide_slots: int = 8
     max_object_slots: int = 16
+    slot_n_layer: int = 2
+    global_tag_scale: float = 1.0
+    dynamic_tag_scale: float = 1.0
     init_std: float = 0.02
 
     def __post_init__(self):
@@ -201,6 +204,7 @@ class AudioEncoder(nn.Module):
 class ConditionEmbedding(nn.Module):
     def __init__(self, cfg: StageConfig):
         super().__init__()
+        self.cfg = cfg
         self.beat_proj = nn.Sequential(
             nn.Linear(cfg.beat_dim, cfg.d_model),
             nn.GELU(),
@@ -209,7 +213,19 @@ class ConditionEmbedding(nn.Module):
         self.diff_linear = nn.Linear(1, cfg.difficulty_dim)
         self.lvl_linear = nn.Linear(1, cfg.level_dim)
         self.tag_embed = nn.Embedding(cfg.tag_vocab_size, cfg.tag_dim)
-        merge_in = cfg.d_model + cfg.difficulty_dim + cfg.level_dim + cfg.tag_dim
+        self.tag_proj = nn.Sequential(
+            nn.Linear(cfg.tag_dim, cfg.d_model),
+            nn.GELU(),
+            nn.Linear(cfg.d_model, cfg.d_model),
+        )
+        self.global_tag_score = nn.Linear(cfg.d_model, 1)
+        self.dynamic_tag_attn = nn.MultiheadAttention(
+            cfg.d_model,
+            cfg.n_head,
+            dropout=cfg.dropout,
+            batch_first=True,
+        )
+        merge_in = cfg.d_model + cfg.difficulty_dim + cfg.level_dim
         self.merge = nn.Sequential(
             nn.Linear(merge_in, cfg.d_model),
             nn.GELU(),
@@ -219,20 +235,92 @@ class ConditionEmbedding(nn.Module):
         self.dropout = nn.Dropout(cfg.dropout)
         self.apply(lambda m: _init_weights(m, cfg.init_std))
 
-    def forward(self, beat, difficulty, level, tags):
+    def forward(self, beat, difficulty, level, tags, frame_query=None):
         B, T, _ = beat.shape
         b = self.beat_proj(beat)
         diff = difficulty.float().clamp(0, 7).unsqueeze(-1)
         d = self.diff_linear(diff).unsqueeze(1).expand(-1, T, -1)
         lvl = level.float().unsqueeze(-1)
         l = self.lvl_linear(lvl).unsqueeze(1).expand(-1, T, -1)
-        t_emb = self.tag_embed(tags.clamp(0, 255))
-        mask = (tags >= 0).float().unsqueeze(-1)
-        t_pool = (t_emb * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1)
-        t_pool = t_pool.unsqueeze(1).expand(-1, T, -1)
-        x = torch.cat([b, d, l, t_pool], dim=-1)
-        x = self.merge(x)
+        x = self.merge(torch.cat([b, d, l], dim=-1))
+
+        max_tag_id = self.tag_embed.num_embeddings - 1
+        valid_tags = tags >= 0
+        has_tags = valid_tags.any(dim=1)
+        safe_tags = tags.clamp(0, max_tag_id)
+        tag_x = self.tag_proj(self.tag_embed(safe_tags))
+
+        # Global tag branch: learned attention pooling over unordered tags.
+        global_scores = self.global_tag_score(tag_x).squeeze(-1)
+        global_scores = global_scores.masked_fill(~valid_tags, -1e4)
+        global_weights = F.softmax(global_scores, dim=1) * valid_tags.float()
+        global_weights = global_weights / global_weights.sum(dim=1, keepdim=True).clamp(min=1.0)
+        global_tag = (global_weights.unsqueeze(-1) * tag_x).sum(dim=1)
+        global_tag = global_tag.unsqueeze(1).expand(-1, T, -1)
+
+        # Dynamic tag branch: each frame queries the tag memory, so tag scope is learned.
+        query = x if frame_query is None else x + frame_query
+        key_padding_mask = ~valid_tags
+        key_padding_mask = key_padding_mask.clone()
+        key_padding_mask[~has_tags, 0] = False
+        dynamic_tag = self.dynamic_tag_attn(
+            query,
+            tag_x,
+            tag_x,
+            key_padding_mask=key_padding_mask,
+            need_weights=False,
+        )[0]
+        tag_active = has_tags.float().view(B, 1, 1)
+        global_tag = global_tag * tag_active
+        dynamic_tag = dynamic_tag * tag_active
+
+        x = (
+            x
+            + float(getattr(self.cfg, "global_tag_scale", 1.0)) * global_tag
+            + float(getattr(self.cfg, "dynamic_tag_scale", 1.0)) * dynamic_tag
+        )
         return self.dropout(self.ln(x))
+
+
+# ============================================================
+# ChartAudioFusion
+# ============================================================
+
+class ChartAudioFusion(nn.Module):
+    """Chart token stream with position encoding and aligned audio conditioning."""
+
+    def __init__(self, cfg: StageConfig):
+        super().__init__()
+        d = cfg.d_model
+        self.chart_pe = FastAHPE(
+            d,
+            cfg.max_seq_len,
+            order=cfg.ahpe_householder_order,
+            learnable=cfg.ahpe_learnable,
+        )
+        self.audio_proj = nn.Linear(d, d)
+        self.gate = nn.Linear(d * 2, d)
+        self.ln = nn.LayerNorm(d)
+        self.dropout = nn.Dropout(cfg.dropout)
+        self.apply(lambda m: _init_weights(m, cfg.init_std))
+
+    def forward(
+        self,
+        chart_x: torch.Tensor,
+        audio_feat: torch.Tensor,
+        cond: torch.Tensor,
+    ) -> torch.Tensor:
+        chart_x = self.chart_pe(chart_x)
+        if audio_feat.shape[1] != chart_x.shape[1]:
+            audio_feat = F.interpolate(
+                audio_feat.transpose(1, 2),
+                size=chart_x.shape[1],
+                mode="linear",
+                align_corners=False,
+            ).transpose(1, 2)
+        gate = torch.sigmoid(self.gate(torch.cat([chart_x, audio_feat], dim=-1)))
+        audio_x = gate * self.audio_proj(audio_feat)
+        return self.dropout(self.ln(chart_x + audio_x + cond))
 
 
 # ============================================================

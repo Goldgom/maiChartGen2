@@ -318,6 +318,21 @@ stage_model:
     :range: "positive integer"
     :value: 16
 
+  slot_n_layer:
+    :description: "Transformer layers used to model slots inside one frame"
+    :range: "positive integer"
+    :value: 2
+
+  global_tag_scale:
+    :description: "Scale for globally pooled tag condition"
+    :range: ">= 0"
+    :value: 1.0
+
+  dynamic_tag_scale:
+    :description: "Scale for per-frame dynamic tag attention condition"
+    :range: ">= 0"
+    :value: 1.0
+
   slide_vocab_size:
     :description: "Slide 路径词汇表最大大小"
     :range: "正整数"
@@ -390,8 +405,46 @@ training:
     :range: ">= 0"
     :value: 20
 
+# ---- 分 Stage 训练覆盖 ---------------------------------------
+# 每个 stageN_training 可以填写 training 中的任意字段。
+# 未填写的字段会继承全局 training。
+stage1_training:
+  learning_rate:
+    :description: "Stage1 learning rate override"
+    :range: "> 0"
+    :value: null
+
+stage2_training:
+  learning_rate:
+    :description: "Stage2 learning rate override"
+    :range: "> 0"
+    :value: null
+
+stage3_training:
+  learning_rate:
+    :description: "Stage3 learning rate override"
+    :range: "> 0"
+    :value: null
+
+stage4_training:
+  learning_rate:
+    :description: "Stage4 learning rate override"
+    :range: "> 0"
+    :value: null
+
+stage5_training:
+  learning_rate:
+    :description: "Stage5 learning rate override"
+    :range: "> 0"
+    :value: null
+
 # ---- 训练循环 ------------------------------------------------
 train_loop:
+  mode:
+    :description: "训练循环模式: stage_epochs=每个stage跑epochs_per_stage个epoch; round_robin=每个stage只跑1个epoch后切换"
+    :range: "stage_epochs | round_robin"
+    :value: stage_epochs
+
   start_stage:
     :description: "Start training from this stage"
     :range: "1 ~ 5"

@@ -5,6 +5,7 @@ webui.py — maiChartGen3 Gradio WebUI
 """
 
 import json
+import sys
 from collections import defaultdict
 from pathlib import Path
 
@@ -12,18 +13,46 @@ import gradio as gr
 import numpy as np
 import torch
 import torch.nn.functional as F
+import re
 
 from models.stage1_chart import Stage1ChartModel
 from models.stage2_hold import Stage2HoldModel
 from models.stage3_slide import Stage3SlideModel
+from models.stage4_break import Stage4BreakModel
+from models.stage5_ex import Stage5ExModel
 from SimaiToken import SimaiToken, SimaiTokenType, _token_to_simai_note as note_to_simai
+from Config import load_config
 
 # ═══════════════════════════════════════════════════════════
-# 全局常量
+# 加载配置
 # ═══════════════════════════════════════════════════════════
-DATA_DIR = "preprocessed"
-CKPT_DIR = "checkpoints"
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+_config_name = None
+for i, arg in enumerate(sys.argv):
+    if arg == "--config" and i + 1 < len(sys.argv):
+        _config_name = sys.argv[i + 1]
+        break
+
+cfg = load_config(_config_name) if _config_name else load_config()
+print(f"[webui] 已加载配置: {cfg.config_name}")
+
+# ═══════════════════════════════════════════════════════════
+# 全局常量 (从配置读取)
+# ═══════════════════════════════════════════════════════════
+DATA_DIR = cfg.preprocess.output_dir
+CKPT_DIR = cfg.paths.model_dir
+OUTPUT_DIR = Path(cfg.paths.output_dir)
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+# 设备: 优先使用配置中的设置，若配置为 cpu 但 cuda 可用则提示
+_cfg_device = cfg.audio.device
+if _cfg_device == "cuda" and not torch.cuda.is_available():
+    print("[webui] 警告: 配置要求 cuda 但不可用，回退到 cpu")
+    DEVICE = "cpu"
+elif _cfg_device == "cpu" and torch.cuda.is_available():
+    print("[webui] 提示: cuda 可用但配置指定为 cpu，使用 cpu")
+    DEVICE = "cpu"
+else:
+    DEVICE = _cfg_device if _cfg_device in ("cuda", "cpu") else ("cuda" if torch.cuda.is_available() else "cpu")
 
 DIFFICULTIES = ["Easy", "Basic", "Advanced", "Expert", "Master", "Re:Master", "UTAGE"]
 DIFF_MAP = {d: i + 1 for i, d in enumerate(DIFFICULTIES)}
@@ -76,7 +105,26 @@ _TAP_IDS = set(v for k, v in VOCAB.items() if k.startswith("tap"))
 _HOLD_IDS = set(v for k, v in VOCAB.items() if k.startswith("hold"))
 _SLIDE_IDS = set(v for k, v in VOCAB.items() if k.startswith("slide"))
 _TOUCH_IDS = set(v for k, v in VOCAB.items() if k.startswith("touch"))
+_TOUCHHOLD_IDS = set(
+    v for k, v in VOCAB.items()
+    if re.match(r"^hold[A-E]\d*$", k)
+)
 _NOTE_IDS = _TAP_IDS | _HOLD_IDS | _SLIDE_IDS | _TOUCH_IDS
+
+
+def _count_simultaneous_taps(token_str: str) -> int:
+    tap_count = 0
+    for part in token_str.split("+"):
+        st = SimaiToken.from_string(part)
+        if st is not None and st.token_type == SimaiTokenType.TAP:
+            tap_count += len(st.position)
+    return tap_count
+
+
+_MULTI_TAP_IDS = {
+    v for k, v in VOCAB.items()
+    if _count_simultaneous_taps(k) >= 3
+}
 
 # 构建偏置掩码张量 (device 无关, 使用时 .to(device))
 def _build_mask(id_set: set, vocab_size: int) -> torch.Tensor:
@@ -92,6 +140,50 @@ BIAS_TAP_MASK = _build_mask(_TAP_IDS, VOCAB_SIZE)
 BIAS_HOLD_MASK = _build_mask(_HOLD_IDS, VOCAB_SIZE)
 BIAS_SLIDE_MASK = _build_mask(_SLIDE_IDS, VOCAB_SIZE)
 BIAS_TOUCH_MASK = _build_mask(_TOUCH_IDS, VOCAB_SIZE)
+BIAS_TOUCHHOLD_MASK = _build_mask(_TOUCHHOLD_IDS, VOCAB_SIZE)
+BIAS_MULTI_TAP_MASK = _build_mask(_MULTI_TAP_IDS, VOCAB_SIZE)
+
+
+def _output_grid_index(frame_idx: int, frame_rate: float, measure_dur: float, subdiv: int) -> tuple[int, int]:
+    t_sec = frame_idx / frame_rate
+    measure = int(t_sec / measure_dur)
+    beat_in_measure = (t_sec % measure_dur) / measure_dur
+    beat_idx = min(round(beat_in_measure * subdiv), subdiv - 1)
+    return measure, beat_idx
+
+
+def _filter_multi_tap_chart(
+    chart: torch.Tensor,
+    frame_rate: float,
+    measure_dur: float,
+    subdiv: int,
+) -> tuple[torch.Tensor, int, int]:
+    """把会在最终输出格子形成三押及以上的 Stage1 token 直接置空。"""
+    filtered_chart = chart.clone()
+    chart_np = filtered_chart[0].detach().cpu().numpy()
+    tap_counts_by_grid: dict[tuple[int, int], int] = defaultdict(int)
+    filtered_tokens = 0
+    filtered_taps = 0
+
+    for frame_idx, tid in enumerate(chart_np):
+        token_str = ID_TO_TOKEN.get(int(tid))
+        if not token_str:
+            continue
+
+        tap_count = _count_simultaneous_taps(token_str)
+        if tap_count <= 0:
+            continue
+
+        grid_idx = _output_grid_index(frame_idx, frame_rate, measure_dur, subdiv)
+        if tap_counts_by_grid[grid_idx] + tap_count >= 3:
+            filtered_chart[0, frame_idx] = EMPTY_ID
+            filtered_tokens += 1
+            filtered_taps += tap_count
+            continue
+
+        tap_counts_by_grid[grid_idx] += tap_count
+
+    return filtered_chart, filtered_tokens, filtered_taps
 
 # ═══════════════════════════════════════════════════════════
 # 模型加载 (延迟加载)
@@ -99,16 +191,36 @@ BIAS_TOUCH_MASK = _build_mask(_TOUCH_IDS, VOCAB_SIZE)
 _models_cache: dict = {}
 
 
+def _load_compatible_state(model, state: dict) -> None:
+    current = model.state_dict()
+    compatible = {}
+    skipped = []
+    for name, tensor in state.items():
+        if name in current and current[name].shape == tensor.shape:
+            compatible[name] = tensor
+        else:
+            skipped.append(name)
+    current.update(compatible)
+    model.load_state_dict(current)
+    if skipped:
+        print(f"Skipped {len(skipped)} incompatible tensors: {skipped[:6]}")
+
+
 def _load_model(stage: int):
     """加载指定 stage 的模型"""
     if stage in _models_cache:
         return _models_cache[stage]
 
-    ckpt_path = Path(CKPT_DIR) / f"stage{stage}_best.pt"
-    if not ckpt_path.exists():
-        ckpt_path = Path(DATA_DIR) / f"stage{stage}_best.pt"
-    if not ckpt_path.exists():
-        ckpt_path = Path(DATA_DIR) / f"stage{stage}.pt"
+    candidates = [
+        Path(CKPT_DIR) / f"stage{stage}_last.pt",
+        Path(CKPT_DIR) / f"stage{stage}_best.pt",
+        Path(DATA_DIR) / f"stage{stage}_last.pt",
+        Path(DATA_DIR) / f"stage{stage}_best.pt",
+        Path(DATA_DIR) / f"stage{stage}.pt",
+    ]
+    ckpt_path = next((p for p in candidates if p.exists()), None)
+    if ckpt_path is None:
+        raise FileNotFoundError(f"Stage {stage} checkpoint not found")
 
     ckpt = torch.load(ckpt_path, map_location=DEVICE, weights_only=False)
     cfg = ckpt.get("config", ckpt.get("cfg"))
@@ -120,10 +232,14 @@ def _load_model(stage: int):
         model = Stage2HoldModel(cfg).to(DEVICE).eval()
     elif stage == 3:
         model = Stage3SlideModel(cfg).to(DEVICE).eval()
+    elif stage == 4:
+        model = Stage4BreakModel(cfg).to(DEVICE).eval()
+    elif stage == 5:
+        model = Stage5ExModel(cfg).to(DEVICE).eval()
     else:
         raise ValueError(f"Unknown stage: {stage}")
 
-    model.load_state_dict(state)
+    _load_compatible_state(model, state)
     _models_cache[stage] = model
     return model
 
@@ -141,6 +257,8 @@ def _biased_sample(
     hold_bias: float,          # Hold 偏置
     slide_bias: float,         # Slide 偏置
     touch_bias: float,         # Touch 偏置
+    touchhold_bias: float,     # TouchHold 偏置
+    filter_multi_tap: bool,    # 过滤三押及以上 Tap token
 ) -> torch.Tensor:
     """对 logits 施加类型偏置后采样"""
     device = logits.device
@@ -151,8 +269,14 @@ def _biased_sample(
     bias += BIAS_HOLD_MASK.to(device) * hold_bias
     bias += BIAS_SLIDE_MASK.to(device) * slide_bias
     bias += BIAS_TOUCH_MASK.to(device) * touch_bias
+    bias += BIAS_TOUCHHOLD_MASK.to(device) * touchhold_bias
 
     logits = logits + bias.view(1, 1, -1)
+    if filter_multi_tap:
+        logits = logits.masked_fill(
+            BIAS_MULTI_TAP_MASK.to(device).view(1, 1, -1).bool(),
+            float("-inf"),
+        )
 
     # Temperature
     if temperature > 0:
@@ -174,28 +298,46 @@ def _biased_sample(
     return tokens
 
 
+def _biased_binary_predict(logits: torch.Tensor, positive_bias: float) -> torch.Tensor:
+    """对二分类 logits 的正类施加偏置后取 argmax。"""
+    if positive_bias:
+        logits = logits.clone()
+        logits[..., 1] += positive_bias
+    return logits.argmax(dim=-1).bool()
+
+
 # ═══════════════════════════════════════════════════════════
 # Slide 路径校验
 # ═══════════════════════════════════════════════════════════
 
+def _slide_first_target(path_str: str) -> tuple[str, int] | None:
+    """Return the first slide connector and target position."""
+    # VXX paths visually end on the second digit.
+    m = re.match(r'^(V)([1-8])([1-8])', path_str)
+    if m:
+        return m.group(1), int(m.group(3))
+
+    m = re.match(r'^(pp|qq|PP|QQ|[><^vVpqszw-])([1-8])', path_str)
+    if m:
+        return m.group(1), int(m.group(2))
+
+    return None
+
+
 def _validate_slide_path(start_pos: str, path_str: str) -> bool:
-    """检查 slide 路径是否合法 (不产生相邻位置)"""
-    import re
+    """检查 slide 路径是否合法 (不产生相邻位置/直线同点)"""
     try:
         start = int(start_pos)
     except ValueError:
         return True  # 非数字位置 (如触摸), 跳过检查
 
-    # 提取路径的第一个目标位置
-    # 匹配模式: -X, >X, <X, ^X, vX, wX, pX, qX, sX, zX, VXX(取第二个数字)
-    m = re.match(r'[><^v\-wpqsz]([1-8])', path_str)
-    if not m:
-        # VXX 格式: V28 → 目标 = 8
-        m = re.match(r'V[1-8]([1-8])', path_str)
-    if m:
-        target = int(m.group(1))
-    else:
+    first = _slide_first_target(path_str)
+    if first is None:
         return True  # 无法解析, 保守放行
+
+    connector, target = first
+    if connector == "-" and target == start:
+        return False  # 1-1[...], 5-5[...] 这类直线同点无效
 
     # 相邻检查: |a-b| == 1 或 == 7 (环形)
     diff = abs(start - target)
@@ -205,11 +347,51 @@ def _validate_slide_path(start_pos: str, path_str: str) -> bool:
     return True
 
 
+def _duration_bin_to_str(dur_bin: int) -> str:
+    secs = 2.0 ** (int(dur_bin) - 5)
+    return f"{max(1, round(secs * 4))}:1"
+
+
+def _default_slide_path(start_pos: str) -> str:
+    try:
+        start = int(start_pos)
+    except ValueError:
+        return "-4"
+    target = ((start + 3) % 8) + 1
+    return f"-{target}"
+
+
+def _slide_vocab_token_to_params(token: str) -> tuple[str, str]:
+    m = re.match(r"^(.+)\[([^\]]+)\]$", token)
+    if m:
+        return m.group(1), m.group(2)
+    return token, ""
+
+
+def _invalid_slide_vocab_ids_for_start(start_pos: str) -> list[int]:
+    invalid = []
+    for pid, token in SLIDE_VOCAB_INV.items():
+        if token in ("<PAD>", "<EOS>"):
+            continue
+        path, _ = _slide_vocab_token_to_params(token)
+        if not _validate_slide_path(start_pos, path):
+            invalid.append(int(pid))
+    return invalid
+
+
+def _as_slot_array(arr: np.ndarray, length: int, slots: int = 1) -> np.ndarray:
+    arr = np.asarray(arr)
+    if arr.ndim == 1:
+        arr = arr[:, None]
+    if arr.shape[0] < length:
+        pad = np.zeros((length - arr.shape[0], arr.shape[1]), dtype=arr.dtype)
+        arr = np.concatenate([arr, pad], axis=0)
+    return arr[:length, :max(slots, arr.shape[1])]
+
+
 # ═══════════════════════════════════════════════════════════
 # 推理核心
 # ═══════════════════════════════════════════════════════════
-OUTPUT_DIR = Path("output")
-OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 
 @torch.no_grad()
@@ -227,8 +409,13 @@ def generate_chart(
     hold_bias: float,
     slide_bias: float,
     touch_bias: float,
+    touchhold_bias: float,
+    break_bias: float,
+    filter_multi_tap: bool,
+    skip_stages: list[str] | None = None,
     progress=gr.Progress(),
 ) -> tuple[str, str]:
+    skip_stages = set(skip_stages or [])
     """核心推理函数，返回 (simai文本, 状态信息)"""
     from AudioTokenizer import AudioTokenizer
     from BeatTokenizer import BeatTokenizer
@@ -238,15 +425,25 @@ def generate_chart(
 
     # ── 1. 音频编码 ──
     progress(0.05, desc="正在编码音频...")
-    at = AudioTokenizer(num_codebooks=8)
+    at = AudioTokenizer(
+        num_codebooks=cfg.audio.num_codebooks,
+        device=DEVICE,
+        local_path=cfg.audio.premodel_path or None,
+    )
     ad = at.encode_file(mp3_path)
-    bt = BeatTokenizer(method="librosa", target_bpm=None, quantize_beats=True)
+    bt = BeatTokenizer(
+        method=cfg.beat.method,
+        target_bpm=None if bpm_override <= 0 else bpm_override,
+        quantize_beats=cfg.beat.quantize_beats,
+        bpm_min=cfg.beat.bpm_min,
+        bpm_max=cfg.beat.bpm_max,
+    )
     bl = bt.analyse(mp3_path)
 
     fr = ad.frame_rate
     nf = ad.num_frames
     bpm = bl.bpm if bpm_override <= 0 else bpm_override
-    subdiv = 32
+    subdiv = cfg.chart.target_subdiv
     measure_dur = 4 * 60.0 / bpm
 
     audio = torch.from_numpy(ad.tokens).unsqueeze(0).long().to(DEVICE)
@@ -295,53 +492,114 @@ def generate_chart(
     result1 = m1.forward(audio, beat, diff_t, lvl_t, tags_t)
     logits1 = result1["logits"]  # (B, T, V)
     chart = _biased_sample(logits1, temperature, top_k,
-                           density, tap_bias, hold_bias, slide_bias, touch_bias)
+                           density, tap_bias, hold_bias, slide_bias, touch_bias,
+                           touchhold_bias, filter_multi_tap)
     T = chart.shape[1]
+    filtered_multi_tap_tokens = 0
+    filtered_multi_tap_count = 0
+    if filter_multi_tap:
+        chart, filtered_multi_tap_tokens, filtered_multi_tap_count = _filter_multi_tap_chart(
+            chart,
+            fr,
+            measure_dur,
+            subdiv,
+        )
 
     hold_ids = {tid for tok, tid in VOCAB.items() if tok.startswith("hold")}
 
     # ── Stage 2: Hold 持续时间 ──
-    progress(0.40, desc="Stage 2: 预测 Hold 持续时间...")
-    m2 = _load_model(2)
-    hold_mask = torch.zeros(1, T, dtype=torch.bool, device=DEVICE)
-    for hid in hold_ids:
-        hold_mask = hold_mask | (chart == hid)
-    dur_pred = m2.generate(chart, audio, beat, diff_t, lvl_t, tags_t, hold_mask,
-                           temperature=temperature)
-    hold_durs = dur_pred[0].cpu().numpy()
-    if hold_durs.ndim == 2:
-        hold_durs = hold_durs[:, 0]
+    if "Stage 2" in skip_stages:
+        hold_durs = np.zeros((T, 1), dtype=np.int64)
+    else:
+        progress(0.35, desc="Stage 2: 预测 Hold 持续时间...")
+        m2 = _load_model(2)
+        hold_mask = torch.zeros(1, T, dtype=torch.bool, device=DEVICE)
+        for hid in hold_ids:
+            hold_mask = hold_mask | (chart == hid)
+        dur_pred = m2.generate(chart, audio, beat, diff_t, lvl_t, tags_t, hold_mask,
+                               temperature=temperature)
+        hold_durs = _as_slot_array(dur_pred[0].cpu().numpy(), T)
 
     # ── Stage 3: Slide 路径 (带采样, 支持多段路径) ──
-    progress(0.65, desc="Stage 3: 预测 Slide 路径...")
-    m3 = _load_model(3)
-    out3 = m3(chart, audio, beat, diff_t, lvl_t, tags_t)
-
-    # slide_logits: (B, T, S, V) 其中 S=max_slide_slots, V=slide_vocab_size
-    slide_logits = out3["logits"][0]  # (T, S, V)
-    S = slide_logits.shape[1]  # max_slide_slots (通常 8)
-
-    # 对每个 slot 独立采样 (temperature + top_k)
-    slide_temp = temperature * 0.7  # slide 略低温度, 更稳定
-    slide_topk = max(10, top_k // 2)
-
-    # 采样: (T, S) → 每帧每 slot 一个 path id
-    if slide_temp > 0:
-        sl = slide_logits / slide_temp
+    if "Stage 3" in skip_stages:
+        slide_paths = np.zeros((T, 1), dtype=np.int64)
     else:
-        sl = slide_logits
+        progress(0.55, desc="Stage 3: 预测 Slide 路径...")
+        m3 = _load_model(3)
+        out3 = m3(chart, audio, beat, diff_t, lvl_t, tags_t)
 
-    if slide_topk > 0 and slide_topk < sl.shape[-1]:
-        topk_vals, _ = torch.topk(sl, slide_topk, dim=-1)
-        min_topk = topk_vals[:, :, -1:]
-        sl = torch.where(sl < min_topk, torch.full_like(sl, float("-inf")), sl)
+        # slide_logits: (B, T, S, V) 其中 S=max_slide_slots, V=slide_vocab_size
+        slide_logits = out3["logits"][0]  # (T, S, V)
+        S = slide_logits.shape[1]  # max_slide_slots (通常 8)
 
-    probs = F.softmax(sl, dim=-1)  # (T, S, V)
-    flat_probs = probs.reshape(-1, sl.shape[-1])  # (T*S, V)
-    slide_paths = torch.multinomial(flat_probs, 1).reshape(T, S).cpu().numpy()  # (T, S)
+        # 对每个 slot 独立采样 (temperature + top_k)
+        slide_temp = temperature * 0.7  # slide 略低温度, 更稳定
+        slide_topk = max(10, top_k // 2)
+
+        if slide_temp > 0:
+            sl = slide_logits / slide_temp
+        else:
+            sl = slide_logits.clone()
+
+        # Mask slide vocab entries that cannot legally attach to the predicted
+        # Stage1 slide start position, e.g. slide1 + -1[8:1] -> 1-1[8:1].
+        chart_np_for_slide = chart[0].detach().cpu().numpy()
+        invalid_slide_ids_by_start: dict[str, list[int]] = {}
+        for f in range(T):
+            tok_str = ID_TO_TOKEN.get(int(chart_np_for_slide[f]))
+            if not tok_str:
+                continue
+            slide_slot = 0
+            for part in tok_str.split("+"):
+                st = SimaiToken.from_string(part)
+                if st is None or st.token_type != SimaiTokenType.SLIDE:
+                    continue
+                if slide_slot >= sl.shape[1]:
+                    break
+                if st.position not in invalid_slide_ids_by_start:
+                    invalid_slide_ids_by_start[st.position] = [
+                        pid for pid in _invalid_slide_vocab_ids_for_start(st.position)
+                        if pid < sl.shape[-1]
+                    ]
+                invalid_ids = invalid_slide_ids_by_start[st.position]
+                if invalid_ids:
+                    sl[f, slide_slot, invalid_ids] = float("-inf")
+                slide_slot += 1
+
+        if slide_topk > 0 and slide_topk < sl.shape[-1]:
+            topk_vals, _ = torch.topk(sl, slide_topk, dim=-1)
+            min_topk = topk_vals[:, :, -1:]
+            sl = torch.where(sl < min_topk, torch.full_like(sl, float("-inf")), sl)
+
+        probs = F.softmax(sl, dim=-1)  # (T, S, V)
+        flat_probs = probs.reshape(-1, sl.shape[-1])  # (T*S, V)
+        slide_paths = torch.multinomial(flat_probs, 1).reshape(T, S).cpu().numpy()
+
+    # ── Stage 4/5: Break / Ex ──
+    note_mask = (chart > 0).bool()
+    if "Stage 4" in skip_stages:
+        break_pred = np.zeros((T, 1), dtype=bool)
+    else:
+        progress(0.70, desc="Stage 4: 预测 Break...")
+        m4 = _load_model(4)
+        break_logits = m4.forward(chart, audio, beat, diff_t, lvl_t, tags_t)["logits"]
+        break_pred = _as_slot_array(
+            _biased_binary_predict(break_logits, break_bias)[0].cpu().numpy(),
+            T,
+        ).astype(bool)
+
+    if "Stage 5" in skip_stages:
+        ex_pred = np.zeros_like(break_pred, dtype=bool)
+    else:
+        progress(0.78, desc="Stage 5: 预测 Ex...")
+        m5 = _load_model(5)
+        ex_pred = _as_slot_array(
+            m5.predict(chart, audio, beat, diff_t, lvl_t, tags_t)[0].cpu().numpy(),
+            T,
+        ).astype(bool)
 
     # ── 构建 simai ──
-    progress(0.80, desc="构建 simai 谱面...")
+    progress(0.85, desc="构建 simai 谱面...")
     chart_np = chart[0].cpu().numpy()
     measures: dict[int, dict[int, list[str]]] = defaultdict(lambda: defaultdict(list))
 
@@ -349,6 +607,8 @@ def generate_chart(
     hold_count = 0
     slide_count = 0
     tap_count = 0
+    break_count = 0
+    ex_count = 0
 
     for f in range(T):
         tid = int(chart_np[f])
@@ -358,57 +618,70 @@ def generate_chart(
         if tok_str is None:
             continue
 
-        st = SimaiToken.from_string(tok_str)
-        if st is None:
-            continue
+        m, bi = _output_grid_index(f, fr, measure_dur, subdiv)
 
-        # 注入 hold 持续时间
-        if st.token_type == SimaiTokenType.HOLD:
-            if hold_durs[f] > 0:
-                dur_bin = int(hold_durs[f])
-                secs = 2.0 ** (dur_bin - 5)
-                dur_str = f"{max(1, round(secs * 4))}:1"
-                st.params["dur"] = dur_str
-            elif "dur" not in st.params or not st.params["dur"]:
-                st.params["dur"] = "4:1"
-            hold_count += 1
+        hold_slot = 0
+        slide_slot = 0
+        frame_objects: list[tuple[SimaiToken, int]] = []
+        for obj_slot, part in enumerate(tok_str.split("+")):
+            st = SimaiToken.from_string(part)
+            if st is None:
+                continue
 
-        # 注入 slide 路径 + 持续时间
-        # 只取 slot 0: vocab 中已有 2004 个单 token 含多段路径 (如 -5*V26, >8*V28)
-        # 多 slot 独立拼接会产生无效语法
-        if st.token_type == SimaiTokenType.SLIDE:
-            pid = int(slide_paths[f, 0])
-            if pid > 1:  # <PAD>=0, <EOS>=1
-                seg = SLIDE_VOCAB_INV.get(pid, "")
-                if seg and seg not in ("<PAD>", "<EOS>"):
-                    # 校验: 防止相邻位置 slide (如 1-2, 8-1)
-                    if _validate_slide_path(st.position, seg):
-                        st.params["path"] = seg
-                    # 相邻路径被丢弃, 模型采样已有足够多样性替补
-            # 数据驱动 timing: 查 path→best_timing 映射
-            if "dur" not in st.params or not st.params["dur"]:
-                path_key = st.params.get("path", "")
-                if path_key and path_key in PATH_BEST_TIMING:
-                    st.params["dur"] = PATH_BEST_TIMING[path_key]
-                elif hold_durs[f] > 0:
-                    dur_bin = int(hold_durs[f])
-                    secs = 2.0 ** (dur_bin - 5)
-                    dur_str = f"{max(1, round(secs * 4))}:1"
-                    st.params["dur"] = dur_str
-                else:
-                    st.params["dur"] = "4:1"  # fallback
+            # 注入 hold 持续时间
+            if st.token_type == SimaiTokenType.HOLD:
+                if hold_slot < hold_durs.shape[1] and hold_durs[f, hold_slot] > 0:
+                    st.params["dur"] = _duration_bin_to_str(int(hold_durs[f, hold_slot]))
+                elif "dur" not in st.params or not st.params["dur"]:
+                    st.params["dur"] = "4:1"
+                hold_slot += 1
+                hold_count += 1
 
-        if st.token_type == SimaiTokenType.TAP:
-            tap_count += 1
+            # 注入 slide 路径 + 持续时间
+            if st.token_type == SimaiTokenType.SLIDE:
+                pid = int(slide_paths[f, slide_slot]) if slide_slot < slide_paths.shape[1] else 0
+                if pid > 1:  # <PAD>=0, <EOS>=1
+                    seg = SLIDE_VOCAB_INV.get(pid, "")
+                    if seg and seg not in ("<PAD>", "<EOS>"):
+                        path, timing = _slide_vocab_token_to_params(seg)
+                        if _validate_slide_path(st.position, path):
+                            st.params["path"] = path
+                            if timing:
+                                st.params["dur"] = timing
+                if "path" not in st.params or not st.params["path"]:
+                    st.params["path"] = _default_slide_path(st.position)
+                if "dur" not in st.params or not st.params["dur"]:
+                    path_key = st.params.get("path", "")
+                    if path_key and path_key in PATH_BEST_TIMING:
+                        st.params["dur"] = PATH_BEST_TIMING[path_key]
+                    elif hold_slot < hold_durs.shape[1] and hold_durs[f, hold_slot] > 0:
+                        st.params["dur"] = _duration_bin_to_str(int(hold_durs[f, hold_slot]))
+                    else:
+                        st.params["dur"] = "4:1"
+                slide_slot += 1
+                slide_count += 1
 
-        note_count += 1
-        simai_note = note_to_simai(st)
+            # 注入 break/ex
+            if obj_slot < break_pred.shape[1] and break_pred[f, obj_slot]:
+                st.params["break"] = ""
+            if obj_slot < ex_pred.shape[1] and ex_pred[f, obj_slot]:
+                st.params["ex"] = ""
 
-        t_sec = f / fr
-        m = int(t_sec / measure_dur)
-        beat_in_m = (t_sec % measure_dur) / measure_dur
-        bi = min(round(beat_in_m * subdiv), subdiv - 1)
-        measures[m][bi].append(simai_note)
+            frame_objects.append((st, obj_slot))
+
+        frame_notes = []
+        for st, _ in frame_objects:
+            if st.token_type == SimaiTokenType.TAP:
+                tap_count += len(st.position)
+            if st.has_break:
+                break_count += 1
+            if st.has_ex:
+                ex_count += 1
+            frame_notes.append(note_to_simai(st))
+            note_count += len(st.position) if st.token_type == SimaiTokenType.TAP else 1
+
+        if frame_notes:
+            measures[m][bi].append("/".join(frame_notes))
 
     # ── 写 simai 文件 ──
     title = Path(mp3_path).parent.name
@@ -429,10 +702,12 @@ def generate_chart(
                 parts.append("/".join(beats[bi]))
             else:
                 parts.append("")
+        body = ",".join(parts) + ","
         if m == 0:
-            lines.append(f"({bpm:.1f}){{{subdiv}}}{','.join(parts)}")
+            lines.append(f"({bpm:.1f}){{{subdiv}}}{body}")
         else:
-            lines.append(f"{{{subdiv}}}{','.join(parts)}")
+            lines.append(f"{{{subdiv}}}{body}")
+    lines.append("E")
 
     simai_text = "\n".join(lines)
 
@@ -442,6 +717,11 @@ def generate_chart(
         f"📊 统计信息:\n"
         f"  - 总音符数: {note_count}\n"
         f"  - Tap: {tap_count} | Hold: {hold_count} | Slide: {slide_count}\n"
+        f"  - Break: {break_count} | Ex: {ex_count}\n"
+        f"  - 三押及以上 Tap token 过滤: {'开启' if filter_multi_tap else '关闭'}"
+        f" (vocab {len(_MULTI_TAP_IDS)} 个, 本次过滤 {filtered_multi_tap_tokens} 个 token/"
+        f"{filtered_multi_tap_count} 个 tap)\n"
+        f"  - 跳过: {', '.join(sorted(skip_stages)) if skip_stages else '无'}\n"
         f"  - 小节数: {max_m + 1} | 帧数: {T}\n"
         f"  - BPM: {bpm:.1f} | 难度: {difficulty} {level:.1f}\n"
         f"  - 设备: {DEVICE}\n"
@@ -470,7 +750,7 @@ def build_ui():
         # 🎹 maiChartGen3 — AI 谱面生成器
         
         上传 MP3 音频，AI 自动生成 maimai 谱面 (simai 格式)。
-        支持 Master 13 难度，使用三阶段 Transformer 模型。
+        支持 Master 13 难度，使用多阶段 Transformer 模型。
         """)
 
         with gr.Row():
@@ -487,16 +767,19 @@ def build_ui():
                 with gr.Row():
                     difficulty = gr.Dropdown(
                         choices=DIFFICULTIES,
-                        value="Master",
+                        value=cfg.chart.default_difficulty if hasattr(cfg.chart, 'default_difficulty') else "Master",
                         label="难度",
                     )
                     level = gr.Slider(
-                        minimum=1.0, maximum=15.0, value=13.0, step=0.1,
+                        minimum=1.0, maximum=15.0,
+                        value=cfg.chart.default_level if hasattr(cfg.chart, 'default_level') else 13.0,
+                        step=0.1,
                         label="等级",
                     )
 
                 designer = gr.Textbox(
-                    value="AI", label="谱面作者 (Designer)",
+                    value=cfg.chart.default_designer if hasattr(cfg.chart, 'default_designer') else "AI",
+                    label="谱面作者 (Designer)",
                     placeholder="输入作者名...",
                 )
 
@@ -511,11 +794,15 @@ def build_ui():
                 gr.Markdown("### 🎛️ 生成控制")
                 with gr.Row():
                     temperature = gr.Slider(
-                        minimum=0.1, maximum=2.0, value=0.8, step=0.05,
+                        minimum=0.1, maximum=2.0,
+                        value=cfg.generation.temperature,
+                        step=0.05,
                         label="Temperature (温度)",
                     )
                     top_k = gr.Slider(
-                        minimum=1, maximum=200, value=50, step=1,
+                        minimum=1, maximum=200,
+                        value=cfg.generation.top_k,
+                        step=1,
                         label="Top-K 采样",
                     )
 
@@ -528,27 +815,47 @@ def build_ui():
                 gr.Markdown("*正值=更多, 负值=更少, 0=不偏置*")
 
                 density = gr.Slider(
-                    minimum=-5.0, maximum=5.0, value=0.0, step=0.5,
+                    minimum=-5.0, maximum=5.0, value=0.0, step=0.01,
                     label="📊 整体密度 (Density)",
                 )
                 with gr.Row():
                     tap_bias = gr.Slider(
-                        minimum=-5.0, maximum=5.0, value=0.0, step=0.5,
+                        minimum=-5.0, maximum=5.0, value=0.0, step=0.01,
                         label="👆 Tap",
                     )
                     hold_bias = gr.Slider(
-                        minimum=-5.0, maximum=5.0, value=0.0, step=0.5,
+                        minimum=-5.0, maximum=5.0, value=0.0, step=0.01,
                         label="✋ Hold",
                     )
                 with gr.Row():
                     slide_bias = gr.Slider(
-                        minimum=-5.0, maximum=5.0, value=0.0, step=0.5,
+                        minimum=-5.0, maximum=5.0, value=0.0, step=0.01,
                         label="⭐ Slide",
                     )
                     touch_bias = gr.Slider(
-                        minimum=-5.0, maximum=5.0, value=0.0, step=0.5,
+                        minimum=-5.0, maximum=5.0, value=0.0, step=0.01,
                         label="🖐 Touch",
                     )
+                with gr.Row():
+                    touchhold_bias = gr.Slider(
+                        minimum=-5.0, maximum=5.0, value=0.0, step=0.01,
+                        label="✋ TouchHold",
+                    )
+                    break_bias = gr.Slider(
+                        minimum=-5.0, maximum=5.0, value=0.0, step=0.01,
+                        label="💥 Break",
+                    )
+
+                filter_multi_tap = gr.Checkbox(
+                    value=True,
+                    label="过滤三押及以上 Tap",
+                )
+
+                skip_stages = gr.CheckboxGroup(
+                    choices=["Stage 2", "Stage 3", "Stage 4", "Stage 5"],
+                    value=["Stage 5"],
+                    label="跳过 Stage",
+                )
 
                 generate_btn = gr.Button(
                     "🚀 生成谱面",
@@ -585,7 +892,7 @@ def build_ui():
 
         # ── 事件绑定 ──
         def on_generate(audio_file, diff, lvl, des, cols, temp, topk, bpm_ov,
-                        dens, tb, hb, sb, ttb):
+                        dens, tb, hb, sb, ttb, thb, bb, fmt, skips):
             if audio_file is None:
                 return "", "❌ 请先上传 MP3 文件！", gr.DownloadButton(visible=False)
 
@@ -593,7 +900,7 @@ def build_ui():
             try:
                 simai_text, info = generate_chart(
                     mp3_path, diff, lvl, des, cols, temp, topk, bpm_ov,
-                    dens, tb, hb, sb, ttb,
+                    dens, tb, hb, sb, ttb, thb, bb, fmt, skips,
                 )
                 # 写入文件供下载
                 out_file = OUTPUT_DIR / "generated.txt"
@@ -608,7 +915,8 @@ def build_ui():
             on_generate,
             inputs=[audio_input, difficulty, level, designer, collection,
                     temperature, top_k, bpm_override,
-                    density, tap_bias, hold_bias, slide_bias, touch_bias],
+                    density, tap_bias, hold_bias, slide_bias, touch_bias,
+                    touchhold_bias, break_bias, filter_multi_tap, skip_stages],
             outputs=[simai_output, status_output, download_btn],
         )
 
@@ -623,7 +931,9 @@ def build_ui():
         | Top-K | 每步只从概率最高的 K 个 token 中采样 | 30~80 |
         | BPM 覆盖 | -1 表示自动检测；手动设置可覆盖检测结果 | -1 |
         | 整体密度 | 正值 → 更密集(更多音符)；负值 → 更稀疏 | 0~2 |
-        | Tap/Hold/Slide/Touch | 正值 → 该类型更多；负值 → 更少 | 0 |
+        | Tap/Hold/Slide/Touch/Break | 正值 → 该类型更多；负值 → 更少 | 0 |
+        | 过滤三押及以上 Tap | 移除同一时刻 3 个或更多 Tap 的无理多押 | 开启 |
+        | 跳过 Stage | 可跳过 Hold/Slide/Break/Ex 后处理；默认跳过 Stage 5 | Stage 5 |
         """)
 
     return demo
@@ -632,10 +942,11 @@ def build_ui():
 if __name__ == "__main__":
     demo = build_ui()
     demo.launch(
-        server_name="0.0.0.0",
-        server_port=7860,
-        share=False,
-        inbrowser=True,
+        server_name=cfg.server.host if hasattr(cfg, 'server') else "0.0.0.0",
+        server_port=cfg.server.port if hasattr(cfg, 'server') else 7860,
+        share=cfg.server.share if hasattr(cfg, 'server') else False,
+        inbrowser=cfg.server.inbrowser if hasattr(cfg, 'server') else True,
+        allowed_paths=[str(OUTPUT_DIR.resolve()), str(Path(DATA_DIR).resolve())],
         theme=gr.themes.Soft(),
         css=CUSTOM_CSS,
     )

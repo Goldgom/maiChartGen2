@@ -54,6 +54,9 @@ stage_model:
   d_ff: 2048                 # FF 中间维度
   dropout: 0.1
   hold_dur_bins: 64
+  slot_n_layer: 2
+  global_tag_scale: 1.0
+  dynamic_tag_scale: 1.0
   slide_vocab_size: 512
 
 # ---- 训练循环 ----
@@ -73,6 +76,7 @@ stage5_model:
   n_layer: 6
 
 train_loop:
+  mode: stage_epochs          # stage_epochs=每个stage跑N epoch; round_robin=每个stage跑1 epoch循环
   start_stage: 1
   epochs_per_stage: 5
   val_samples_per_difficulty: 25
@@ -94,6 +98,30 @@ training:
   weight_decay: 0.01
   scheduler: cosine
   grad_clip: 1.0
+
+# ---- 分 Stage 训练超参 (未写字段会继承 training) ----
+stage1_training:
+  batch_size: 1              
+  gradient_accumulation_steps: 8  
+  learning_rate: 0.0003
+  warmup_steps: 2000
+
+stage2_training:
+  learning_rate: 0.0002
+  warmup_steps: 1500
+
+stage3_training:
+  learning_rate: 0.0001
+  warmup_steps: 3000
+  gradient_accumulation_steps: 4
+
+stage4_training:
+  learning_rate: 0.0002
+  warmup_steps: 1500
+
+stage5_training:
+  learning_rate: 0.0002
+  warmup_steps: 1500
 
 # ---- 模型 (全局, 用于向下兼容) ----
 model:

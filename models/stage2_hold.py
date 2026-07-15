@@ -23,7 +23,7 @@ import torch.nn.functional as F
 
 from models.common import (
     StageConfig, AudioEncoder, ConditionEmbedding,
-    make_model, build_causal_mask,
+    ChartAudioFusion, make_model, build_causal_mask,
 )
 
 
@@ -39,7 +39,7 @@ class Stage2HoldModel(nn.Module):
 
         # 谱面 token 嵌入
         self.chart_embed = nn.Embedding(cfg.chart_vocab_size, cfg.d_model)
-        self.pos_enc = nn.Sequential()  # 占位, PE 在 forward 中手动加
+        self.chart_fusion = ChartAudioFusion(cfg)
 
         # Transformer (causal, cross-attn 到音频)
         self.layers = make_model(cfg, cfg.n_layer, cross_attn=True)
@@ -76,10 +76,16 @@ class Stage2HoldModel(nn.Module):
 
         # 1. 音频 + 条件
         audio_feat = self.audio_encoder(audio_tokens)
-        cond = self.cond_embed(beat_signal, difficulty, level, tag_ids)
-
-        # 2. 谱面 token 嵌入 + 条件
-        x = self.chart_embed(stage1_chart.long()) + cond  # (B, T, d_model)
+        # 2. 谱面 token 嵌入 + 位置编码 + 同帧音频依赖 + 条件
+        chart_x = self.chart_embed(stage1_chart.long())
+        cond = self.cond_embed(
+            beat_signal,
+            difficulty,
+            level,
+            tag_ids,
+            frame_query=chart_x,
+        )
+        x = self.chart_fusion(chart_x, audio_feat, cond)  # (B, T, d_model)
 
         # 3. Causal mask: 每帧只能看到之前
         causal_mask = build_causal_mask(T, device)
