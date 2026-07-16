@@ -219,11 +219,15 @@ class AudioTokenizer:
     def _load_audio(path: Union[str, Path]) -> tuple[np.ndarray, int]:
         """加载音频文件 → (waveform, sample_rate)
 
-        尝试顺序: soundfile → librosa → torchaudio(仅wav)
+        尝试顺序: soundfile → librosa → ffmpeg(video) → torchaudio
         """
+        import subprocess
         path = str(path)
+        path_obj = Path(path)
+        ext = path_obj.suffix.lower()
+        _VIDEO_EXTS = {".mp4", ".webm", ".mkv", ".mov", ".avi", ".flv", ".wmv", ".m4v"}
 
-        # 1. soundfile (支持 mp3 需要系统有 libsndfile + mpg123)
+        # 1. soundfile (支持 mp3/wav/flac/ogg 等)
         try:
             import soundfile as sf
             data, sr = sf.read(path, dtype="float32")
@@ -245,7 +249,44 @@ class AudioTokenizer:
         except Exception:
             pass
 
-        # 3. torchaudio (仅 wav 等原生格式)
+        # 3. ffmpeg 子进程解码 (用于视频文件, 也作为音频兜底)
+        if ext in _VIDEO_EXTS or True:  # 始终尝试 ffmpeg 作为通用解码器
+            try:
+                # 查找 ffmpeg: 优先 PATH, 其次 imageio_ffmpeg 内置
+                ffmpeg_bin = "ffmpeg"
+                try:
+                    subprocess.run([ffmpeg_bin, "-version"], capture_output=True, timeout=5, check=True)
+                except (FileNotFoundError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+                    try:
+                        import imageio_ffmpeg
+                        ffmpeg_bin = imageio_ffmpeg.get_ffmpeg_exe()
+                    except Exception:
+                        pass
+
+                # 将音频解码为原始 PCM s16le, 采样率重采样到 24kHz (EnCodec 原生采样率)
+                proc = subprocess.run(
+                    [
+                        ffmpeg_bin, "-y", "-i", path,
+                        "-f", "s16le", "-acodec", "pcm_s16le",
+                        "-ar", "24000", "-ac", "2",
+                        "pipe:1",
+                    ],
+                    capture_output=True,
+                    timeout=120,
+                    check=True,
+                )
+                raw = np.frombuffer(proc.stdout, dtype=np.int16)
+                if len(raw) == 0:
+                    raise RuntimeError("ffmpeg 输出为空")
+                # 重排为 (channels, samples)
+                raw = raw.reshape(-1, 2).T.astype(np.float32) / 32768.0
+                return raw, 24000
+            except (FileNotFoundError, subprocess.CalledProcessError):
+                pass
+            except Exception:
+                pass
+
+        # 4. torchaudio (最后兜底)
         try:
             import torchaudio
             waveform, sr = torchaudio.load(str(path))

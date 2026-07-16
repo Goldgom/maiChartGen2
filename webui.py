@@ -27,10 +27,12 @@ from Config import load_config
 # 加载配置
 # ═══════════════════════════════════════════════════════════
 _config_name = None
+_cli_port = None
 for i, arg in enumerate(sys.argv):
     if arg == "--config" and i + 1 < len(sys.argv):
         _config_name = sys.argv[i + 1]
-        break
+    elif arg == "--port" and i + 1 < len(sys.argv):
+        _cli_port = int(sys.argv[i + 1])
 
 cfg = load_config(_config_name) if _config_name else load_config()
 print(f"[webui] 已加载配置: {cfg.config_name}")
@@ -804,10 +806,11 @@ def build_ui():
                         label="等级",
                     )
 
-                designer = gr.Textbox(
-                    value=cfg.chart.default_designer if hasattr(cfg.chart, 'default_designer') else "AI",
+                designer = gr.Dropdown(
+                    choices=DESIGNER_TAGS,
+                    value="AI",
                     label="谱面作者 (Designer)",
-                    placeholder="输入作者名...",
+                    allow_custom_value=True,
                 )
 
                 collection = gr.Dropdown(
@@ -972,9 +975,15 @@ def build_ui():
 
 if __name__ == "__main__":
     demo = build_ui()
+    # 端口优先级: CLI --port > 配置文件 server.port > 默认 7860
+    _port = _cli_port
+    if _port is None and hasattr(cfg, 'server'):
+        _port = cfg.server.port
+    if _port is None:
+        _port = 7860
     demo.launch(
         server_name=cfg.server.host if hasattr(cfg, 'server') else "0.0.0.0",
-        server_port=cfg.server.port if hasattr(cfg, 'server') else 7860,
+        server_port=_port,
         share=cfg.server.share if hasattr(cfg, 'server') else False,
         inbrowser=cfg.server.inbrowser if hasattr(cfg, 'server') else True,
         allowed_paths=[str(OUTPUT_DIR.resolve()), str(Path(DATA_DIR).resolve())],
