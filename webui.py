@@ -74,6 +74,17 @@ else:
     SLIDE_VOCAB = {"<PAD>": 0}
 SLIDE_VOCAB_INV = {v: k for k, v in SLIDE_VOCAB.items()}
 
+
+def _is_wifi_slide_vocab_token(token: str) -> bool:
+    path = re.sub(r"\[[^\]]+\]$", "", token)
+    return re.search(r"(^|\*)w[1-8]", path) is not None
+
+
+_WIFI_SLIDE_IDS = {
+    int(v) for k, v in SLIDE_VOCAB.items()
+    if k not in ("<PAD>", "<EOS>") and _is_wifi_slide_vocab_token(k)
+}
+
 # 加载 path → best_timing 映射 (从训练数据统计)
 _timing_map_path = Path(DATA_DIR) / "slide_path_timing_map.json"
 if _timing_map_path.exists():
@@ -142,6 +153,18 @@ BIAS_SLIDE_MASK = _build_mask(_SLIDE_IDS, VOCAB_SIZE)
 BIAS_TOUCH_MASK = _build_mask(_TOUCH_IDS, VOCAB_SIZE)
 BIAS_TOUCHHOLD_MASK = _build_mask(_TOUCHHOLD_IDS, VOCAB_SIZE)
 BIAS_MULTI_TAP_MASK = _build_mask(_MULTI_TAP_IDS, VOCAB_SIZE)
+BIAS_WIFI_SLIDE_MASK = _build_mask(_WIFI_SLIDE_IDS, max(SLIDE_VOCAB_INV.keys(), default=0) + 1)
+print(f"Loaded wifi slide paths: {len(_WIFI_SLIDE_IDS)}")
+
+
+def _mask_like_logits(mask: torch.Tensor, logits: torch.Tensor) -> torch.Tensor:
+    target = logits.shape[-1]
+    mask = mask.to(logits.device)
+    if mask.shape[0] == target:
+        return mask
+    if mask.shape[0] > target:
+        return mask[:target]
+    return F.pad(mask, (0, target - mask.shape[0]))
 
 
 def _output_grid_index(frame_idx: int, frame_rate: float, measure_dur: float, subdiv: int) -> tuple[int, int]:
@@ -408,6 +431,7 @@ def generate_chart(
     tap_bias: float,
     hold_bias: float,
     slide_bias: float,
+    wifi_bias: float,
     touch_bias: float,
     touchhold_bias: float,
     break_bias: float,
@@ -540,6 +564,8 @@ def generate_chart(
             sl = slide_logits / slide_temp
         else:
             sl = slide_logits.clone()
+        if wifi_bias:
+            sl = sl + _mask_like_logits(BIAS_WIFI_SLIDE_MASK, sl).view(1, 1, -1) * wifi_bias
 
         # Mask slide vocab entries that cannot legally attach to the predicted
         # Stage1 slide start position, e.g. slide1 + -1[8:1] -> 1-1[8:1].
@@ -721,6 +747,7 @@ def generate_chart(
         f"  - 三押及以上 Tap token 过滤: {'开启' if filter_multi_tap else '关闭'}"
         f" (vocab {len(_MULTI_TAP_IDS)} 个, 本次过滤 {filtered_multi_tap_tokens} 个 token/"
         f"{filtered_multi_tap_count} 个 tap)\n"
+        f"  - WiFi bias: {wifi_bias:.2f} (vocab {len(_WIFI_SLIDE_IDS)} 个)\n"
         f"  - 跳过: {', '.join(sorted(skip_stages)) if skip_stages else '无'}\n"
         f"  - 小节数: {max_m + 1} | 帧数: {T}\n"
         f"  - BPM: {bpm:.1f} | 难度: {difficulty} {level:.1f}\n"
@@ -832,11 +859,15 @@ def build_ui():
                         minimum=-5.0, maximum=5.0, value=0.0, step=0.01,
                         label="⭐ Slide",
                     )
+                    wifi_bias = gr.Slider(
+                        minimum=-5.0, maximum=5.0, value=0.0, step=0.01,
+                        label="📶 WiFi",
+                    )
+                with gr.Row():
                     touch_bias = gr.Slider(
                         minimum=-5.0, maximum=5.0, value=0.0, step=0.01,
                         label="🖐 Touch",
                     )
-                with gr.Row():
                     touchhold_bias = gr.Slider(
                         minimum=-5.0, maximum=5.0, value=0.0, step=0.01,
                         label="✋ TouchHold",
@@ -892,7 +923,7 @@ def build_ui():
 
         # ── 事件绑定 ──
         def on_generate(audio_file, diff, lvl, des, cols, temp, topk, bpm_ov,
-                        dens, tb, hb, sb, ttb, thb, bb, fmt, skips):
+                        dens, tb, hb, sb, wb, ttb, thb, bb, fmt, skips):
             if audio_file is None:
                 return "", "❌ 请先上传 MP3 文件！", gr.DownloadButton(visible=False)
 
@@ -900,7 +931,7 @@ def build_ui():
             try:
                 simai_text, info = generate_chart(
                     mp3_path, diff, lvl, des, cols, temp, topk, bpm_ov,
-                    dens, tb, hb, sb, ttb, thb, bb, fmt, skips,
+                    dens, tb, hb, sb, wb, ttb, thb, bb, fmt, skips,
                 )
                 # 写入文件供下载
                 out_file = OUTPUT_DIR / "generated.txt"
@@ -915,7 +946,7 @@ def build_ui():
             on_generate,
             inputs=[audio_input, difficulty, level, designer, collection,
                     temperature, top_k, bpm_override,
-                    density, tap_bias, hold_bias, slide_bias, touch_bias,
+                    density, tap_bias, hold_bias, slide_bias, wifi_bias, touch_bias,
                     touchhold_bias, break_bias, filter_multi_tap, skip_stages],
             outputs=[simai_output, status_output, download_btn],
         )

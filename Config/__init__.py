@@ -159,6 +159,73 @@ class GenerationConfig:
 
 
 @dataclass
+class BatchInferConfig:
+    """批量推理配置
+
+    每个难度可以有独立的推理参数，未指定的参数继承全局默认值。
+
+    difficulties 格式:
+      - name: "Master"          # 难度名称 (必填)
+        level: 13.0             # 等级 (必填)
+        temperature: 1.0        # 可选覆盖: 采样温度
+        density: 1.0            # 可选覆盖: 密度偏置
+        tap_bias: 0.5           # 可选覆盖: Tap 偏置
+        ...                     # 任何全局参数均可按难度覆盖
+    """
+
+    # ── 路径 ──
+    input_dir: str = "samples"
+    output_dir: str = "output/batch"
+
+    # ── 文件类型 ──
+    audio_extensions: list[str] = field(default_factory=lambda: [".mp3", ".wav", ".ogg", ".flac"])
+    video_extensions: list[str] = field(default_factory=lambda: [".mp4", ".webm", ".mkv"])
+    output_subdir_template: str = "{input_name}"
+
+    # ── 难度列表 (每项为 dict: {name, level, 可选覆盖参数...}) ──
+    # 兼容旧格式: 纯字符串列表自动转为 {"name": str, "level": ...}
+    difficulties: list = field(default_factory=lambda: [
+        {"name": "Master", "level": 13.0}
+    ])
+
+    # ── 标签 ──
+    designer: str = "AI"
+    collections: list[str] = field(default_factory=lambda: [
+        "Original",
+        "niconicoボーカロイド",
+        "POPSアニメ",
+        "翠楼屋",
+        "DX Chart",
+        "maimai DX CiRCLE",
+    ])
+
+    # ── 全局生成参数 (各难度未覆盖时使用) ──
+    top_k: int = 50
+    bpm_override: float = 0.0
+    density: float = 0.0
+    tap_bias: float = 0.0
+    hold_bias: float = 0.0
+    slide_bias: float = 0.0
+    wifi_bias: float = 0.0
+    touch_bias: float = 0.0
+    touchhold_bias: float = 0.0
+    break_bias: float = 0.0
+    filter_multi_tap: bool = True
+    allow_touch: bool = False
+    beat_method: str = "librosa"
+    skip_stages: list[str] = field(default_factory=lambda: ["Stage 5"])
+
+    # ── 输出选项 ──
+    copy_audio: bool = True
+    audio_format: str = "mp3"
+    audio_bitrate: str = "192k"
+    copy_video: bool = True
+    extract_bg: bool = True
+    bg_max_size: int = 512
+    skip_existing: bool = False
+
+
+@dataclass
 class StageModelConfig:
     model_type: str = "transformer"
     d_model: int = 512
@@ -196,6 +263,7 @@ class Config:
     stage5_training: TrainingConfig = field(default_factory=TrainingConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
     generation: GenerationConfig = field(default_factory=GenerationConfig)
+    batch_infer: BatchInferConfig = field(default_factory=BatchInferConfig)
     stage_model: StageModelConfig = field(default_factory=StageModelConfig)
     stage1_model: StageModelConfig = field(default_factory=StageModelConfig)
     stage2_model: StageModelConfig = field(default_factory=StageModelConfig)
@@ -285,6 +353,7 @@ class Config:
         for section_name in ["paths", "audio", "chart", "beat", "preprocess", "tags", "train_loop", "data", "model",
                               "training", "stage1_training", "stage2_training", "stage3_training",
                               "stage4_training", "stage5_training", "logging", "generation",
+                              "batch_infer",
                               "stage_model", "stage1_model", "stage2_model", "stage3_model",
                               "stage4_model", "stage5_model"]:
             section = getattr(self, section_name)
@@ -483,6 +552,7 @@ class ConfigLoader:
             stage5_training=TrainingConfig(**_coerce(TrainingConfig, _stage_training_values("stage5_training"))),
             logging=LoggingConfig(**_coerce(LoggingConfig, values.get("logging", {}))),
             generation=GenerationConfig(**_coerce(GenerationConfig, values.get("generation", {}))),
+            batch_infer=BatchInferConfig(**_coerce(BatchInferConfig, values.get("batch_infer", {}))),
             stage_model=StageModelConfig(**_coerce(StageModelConfig, base_stage_raw)),
             stage1_model=StageModelConfig(**_coerce(StageModelConfig, _stage_values("stage1_model"))),
             stage2_model=StageModelConfig(**_coerce(StageModelConfig, _stage_values("stage2_model"))),

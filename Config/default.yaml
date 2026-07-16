@@ -124,3 +124,49 @@ generation:
   max_new_tokens: 4096
   do_sample: true
   num_beams: 1
+batch_infer:
+  input_dir: samples
+  output_dir: output/batch
+  audio_extensions:
+    - ".mp3"
+    - ".wav"
+    - ".ogg"
+    - ".flac"
+  video_extensions:
+    - ".mp4"
+    - ".webm"
+    - ".mkv"
+  output_subdir_template: "{input_name}"
+  difficulties:
+    - name: "Master"
+      level: 13.0
+  designer: "AI"
+  collections:
+    - "Original"
+    - "niconicoボーカロイド"
+    - "POPSアニメ"
+    - "翠楼屋"
+    - "DX Chart"
+    - "maimai DX CiRCLE"
+  bpm_override: 0
+  density: 0.0
+  tap_bias: 0.0
+  hold_bias: 0.0
+  slide_bias: 0.0
+  wifi_bias: 0.0
+  touch_bias: 0.0
+  touchhold_bias: 0.0
+  break_bias: 0.0
+  top_k: 50
+  filter_multi_tap: true
+  allow_touch: false
+  beat_method: "librosa"
+  skip_stages:
+    - "Stage 5"
+  copy_audio: true
+  audio_format: "mp3"
+  audio_bitrate: "192k"
+  copy_video: true
+  extract_bg: true
+  bg_max_size: 512
+  skip_existing: false

@@ -75,6 +75,11 @@ class SimaiToken:
             ttype = SimaiTokenType(match.group(1))
         except ValueError:
             return None
+        position = match.group(2)
+        if ttype == SimaiTokenType.TOUCH and re.fullmatch(r"[ABDE]", position):
+            return None
+        if ttype == SimaiTokenType.HOLD and re.fullmatch(r"[ABDE]", position):
+            return None
         params = {}
         if match.group(3):
             for part in match.group(3).split(","):
@@ -84,7 +89,7 @@ class SimaiToken:
                     params[k.strip()] = v.strip()
                 else:
                     params[part] = ""
-        return cls(token_type=ttype, position=match.group(2), params=params)
+        return cls(token_type=ttype, position=position, params=params)
 
     @property
     def is_note(self) -> bool:
@@ -128,8 +133,8 @@ class SimaiTokenizer:
     TOUCH_HOLD_PATTERN = re.compile(r'^([A-E])(\d*)h\[(.+?)\]$')
     BREAK_EX_TAP_PATTERN = re.compile(r'^(\d+)([bx]+)$')
     SIMPLE_TAP_PATTERN = re.compile(r'^(\d+)$')
-    TOUCH_PATTERN = re.compile(r'^([A-E])(\d*)$')
-    TOUCH_FIREWORK_PATTERN = re.compile(r'^([A-E])(\d*)f$')
+    TOUCH_PATTERN = re.compile(r'^(C\d*|[ABDE]\d+)$')
+    TOUCH_FIREWORK_PATTERN = re.compile(r'^(C\d*|[ABDE]\d+)f$')
 
     def __init__(self, bpm: float = 120.0):
         self.bpm = bpm
@@ -284,6 +289,9 @@ class SimaiTokenizer:
         beat_str = beat_str.strip()
         if not beat_str:
             return None
+        # Simai uses standalone "E" as an end marker. It is not a touch note.
+        if beat_str == "E":
+            return None
 
         mk = lambda tt, pos, **kw: SimaiToken(
             tt, pos, {k: v for k, v in kw.items() if v is not None},
@@ -306,14 +314,13 @@ class SimaiTokenizer:
         # Firework Touch: C1f
         m = self.TOUCH_FIREWORK_PATTERN.match(beat_str)
         if m:
-            pos = f"{m.group(1)}{m.group(2)}" if m.group(2) else m.group(1)
-            return mk(SimaiTokenType.TOUCH, pos, firework="")
+            return mk(SimaiTokenType.TOUCH, m.group(1), firework="")
 
-        # Simple Touch: B1, C, E4
+        # Simple Touch: B1, C, E4. A/B/D/E require an explicit zone number;
+        # bare E is the chart end marker above.
         m = self.TOUCH_PATTERN.match(beat_str)
         if m:
-            pos = f"{m.group(1)}{m.group(2)}" if m.group(2) else m.group(1)
-            return mk(SimaiTokenType.TOUCH, pos)
+            return mk(SimaiTokenType.TOUCH, m.group(1))
 
         # Hold: 1h[4:1], 1bh[4:1]
         m = self.HOLD_PATTERN.match(beat_str)
@@ -428,6 +435,8 @@ def _token_to_simai_note(t: SimaiToken) -> str:
     if t.token_type == SimaiTokenType.HOLD:
         dur = t.params.get("dur", "")
         pos = t.position
+        if not pos or re.fullmatch(r"[ABDE]", pos):
+            return ""
         if pos[0] in "ABCDE":
             if t.has_firework:
                 return f"{pos}fh[{dur}]"
@@ -442,14 +451,18 @@ def _token_to_simai_note(t: SimaiToken) -> str:
 
     if t.token_type == SimaiTokenType.TOUCH:
         # 合并的 touch → 拆回 each: "B3B4" → "B3/B4"
-        import re
-        parts = re.findall(r'[A-E]\d*', t.position)
+        parts = [
+            p for p in re.findall(r'[A-E]\d*', t.position)
+            if p.startswith("C") or re.fullmatch(r"[ABDE]\d+", p)
+        ]
+        if not parts:
+            return ""
         if len(parts) > 1:
             fw = "f" if t.has_firework else ""
             return "/".join(p + fw for p in parts)
         if t.has_firework:
-            return f"{t.position}f"
-        return t.position
+            return f"{parts[0]}f"
+        return parts[0]
 
     return ""
 
