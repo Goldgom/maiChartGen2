@@ -180,7 +180,7 @@ batch_infer:
 
     - name: "Advanced"
       level: 10.0
-      density: 0.95        # 低密度, 简洁
+      density: 0.85        # 低密度, 简洁
       tap_bias: 0.3
       hold_bias: 0.5
       slide_bias: 1.5
@@ -194,7 +194,7 @@ batch_infer:
 
     - name: "Expert"
       level: 12.5
-      density: 1.58         # 中等密度
+      density: 1.48         # 中等密度
       tap_bias: 0.48
       hold_bias: 0.1
       slide_bias: 1.0
@@ -228,7 +228,7 @@ batch_infer:
       slide_bias: 0.9
       touch_bias: 3
       touchhold_bias: 2.6
-      temperature: 0.3
+      temperature: 0.35
       break_bias: 2.5
       filter_multi_tap: true
       skip_stages:
