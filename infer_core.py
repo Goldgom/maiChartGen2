@@ -1061,7 +1061,7 @@ class InferenceEngine:
             else:
                 body_lines.append(f"{{{subdiv}}}{','.join(parts)}")
 
-        simai_body = "\n".join(body_lines)
+        simai_body = "\n".join(body_lines) + "\nE"
         return simai_body, bpm, note_count
 
 
