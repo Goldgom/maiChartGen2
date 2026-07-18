@@ -105,7 +105,7 @@ def infer_3stage(
     print("Stage 1: chart skeleton...")
     ckpt1, cfg1, state1 = load_stage_checkpoint(1)
     m1 = Stage1ChartModel(cfg1).to(device).eval()
-    m1.load_state_dict(state1)
+    m1.load_state_dict(state1, strict=False)
     pred1 = m1.generate(audio, beat, diff_t, lvl_t, tags_t, temperature=0.8, top_k=50)
     chart = pred1  # (1, T)
     T = chart.shape[1]

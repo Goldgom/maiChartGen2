@@ -140,7 +140,7 @@ def train(
             diff, lvl, tags = diff.to(device), lvl.to(device), tags.to(device)
 
             optimizer.zero_grad()
-            logits = model(audio, beat, diff, lvl, tags)["logits"]
+            logits = model(audio, beat, diff, lvl, tags, chart_tokens=chart)["logits"]
             loss = nn.functional.cross_entropy(
                 logits.reshape(-1, cfg.chart_vocab_size),
                 chart.reshape(-1).long(),
@@ -161,7 +161,7 @@ def train(
             for audio, beat, chart, diff, lvl, tags in val_loader:
                 audio, beat, chart = audio.to(device), beat.to(device), chart.to(device)
                 diff, lvl, tags = diff.to(device), lvl.to(device), tags.to(device)
-                logits = model(audio, beat, diff, lvl, tags)["logits"]
+                logits = model(audio, beat, diff, lvl, tags, chart_tokens=chart)["logits"]
                 loss = nn.functional.cross_entropy(
                     logits.reshape(-1, cfg.chart_vocab_size),
                     chart.reshape(-1).long(),

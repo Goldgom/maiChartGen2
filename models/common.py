@@ -348,13 +348,19 @@ class TransformerBlock(nn.Module):
         self.drop_ff = nn.Dropout(cfg.dropout)
         self.apply(lambda m: _init_weights(m, cfg.init_std))
 
-    def forward(self, x, memory=None, causal_mask=None):
+    def forward(self, x, memory=None, causal_mask=None, memory_mask=None):
         r = x; x = self.ln1(x)
         x = self.self_attn(x, x, x, attn_mask=causal_mask, need_weights=False)[0]
         x = self.drop_attn(x) + r
         if self.cross_attn and memory is not None:
             r = x; x = self.ln_cross(x)
-            x = self.cross_attn_layer(x, memory, memory, need_weights=False)[0]
+            x = self.cross_attn_layer(
+                x,
+                memory,
+                memory,
+                attn_mask=memory_mask,
+                need_weights=False,
+            )[0]
             x = self.drop_cross(x) + r
         r = x; x = self.ln2(x); x = self.ff(x); x = self.drop_ff(x) + r
         return x

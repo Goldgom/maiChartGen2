@@ -343,6 +343,35 @@ class InferenceEngine:
             logits.shape[0], -1)
         return tokens
 
+    def _apply_stage1_bias(
+        self, logits: torch.Tensor, density: float, tap_bias: float,
+        hold_bias: float, slide_bias: float, touch_bias: float,
+        touchhold_bias: float, filter_multi_tap: bool,
+        allow_touch: bool = True,
+    ) -> torch.Tensor:
+        """Apply Stage1 sampling biases without sampling, for AR generation."""
+        bias = (self._mask_like_logits(self.bias_note, logits) -
+                self._mask_like_logits(self.bias_empty, logits)) * density
+        bias += self._mask_like_logits(self.bias_tap, logits) * tap_bias
+        bias += self._mask_like_logits(self.bias_hold, logits) * hold_bias
+        bias += self._mask_like_logits(self.bias_slide, logits) * slide_bias
+        bias += self._mask_like_logits(self.bias_touch, logits) * touch_bias
+        bias += self._mask_like_logits(self.bias_touchhold, logits) * touchhold_bias
+
+        logits = logits + bias.view(1, 1, -1)
+        if filter_multi_tap:
+            logits = logits.masked_fill(
+                self._mask_like_logits(self.bias_multi_tap, logits).view(1, 1, -1).bool(),
+                float("-inf"),
+            )
+        if not allow_touch:
+            touch_mask = (
+                self._mask_like_logits(self.bias_touch, logits) +
+                self._mask_like_logits(self.bias_touchhold, logits)
+            ).bool()
+            logits = logits.masked_fill(touch_mask.view(1, 1, -1), float("-inf"))
+        return logits
+
     # ═══════════════════════════════════════════════════════════
     # 三押过滤
     # ═══════════════════════════════════════════════════════════
@@ -548,13 +577,21 @@ class InferenceEngine:
         if verbose:
             print("[infer] Stage 1: 谱面骨架...")
         m1 = self.load_model(1)
-        result1 = m1.forward(audio, beat, diff_t, lvl_t, tags_t)
-        logits1 = result1["logits"]
-        chart = self._biased_sample(
-            logits1, temperature, top_k,
-            density, tap_bias, hold_bias, slide_bias,
-            touch_bias, touchhold_bias, filter_multi_tap,
-            allow_touch=allow_touch,
+        chart = m1.generate(
+            audio, beat, diff_t, lvl_t, tags_t,
+            temperature=temperature,
+            top_k=top_k,
+            logits_processor=lambda logits: self._apply_stage1_bias(
+                logits,
+                density,
+                tap_bias,
+                hold_bias,
+                slide_bias,
+                touch_bias,
+                touchhold_bias,
+                filter_multi_tap,
+                allow_touch=allow_touch,
+            ),
         )
         T = chart.shape[1]
         filtered_multi_tap_tokens = 0
@@ -887,12 +924,21 @@ class InferenceEngine:
 
         # ── Stage 1 ──
         m1 = self.load_model(1)
-        result1 = m1.forward(audio, beat, diff_t, lvl_t, tags_t)
-        chart = self._biased_sample(
-            result1["logits"], temperature, top_k,
-            density, tap_bias, hold_bias, slide_bias,
-            touch_bias, touchhold_bias, filter_multi_tap,
-            allow_touch=allow_touch,
+        chart = m1.generate(
+            audio, beat, diff_t, lvl_t, tags_t,
+            temperature=temperature,
+            top_k=top_k,
+            logits_processor=lambda logits: self._apply_stage1_bias(
+                logits,
+                density,
+                tap_bias,
+                hold_bias,
+                slide_bias,
+                touch_bias,
+                touchhold_bias,
+                filter_multi_tap,
+                allow_touch=allow_touch,
+            ),
         )
         T = chart.shape[1]
         if filter_multi_tap:
