@@ -518,7 +518,7 @@ class Trainer:
         audio, beat, chart, brk, ex, obj_mask, hold_dur, slide_path, diff, lvl, tags, valid = [x.to(self.device) for x in batch]
 
         if stage == 1:
-            logits = model(audio, beat, diff, lvl, tags)["logits"]
+            logits = model(audio, beat, diff, lvl, tags, chart_tokens=chart)["logits"]
             return F.cross_entropy(
                 logits[valid],
                 chart[valid].long(),

@@ -323,6 +323,34 @@ def _biased_sample(
     return tokens
 
 
+def _apply_stage1_bias(
+    logits: torch.Tensor,
+    density: float,
+    tap_bias: float,
+    hold_bias: float,
+    slide_bias: float,
+    touch_bias: float,
+    touchhold_bias: float,
+    filter_multi_tap: bool,
+) -> torch.Tensor:
+    """Apply Stage1 sampling biases without sampling, for AR generation."""
+    device = logits.device
+    bias = (BIAS_NOTE_MASK.to(device) - BIAS_EMPTY_MASK.to(device)) * density
+    bias += BIAS_TAP_MASK.to(device) * tap_bias
+    bias += BIAS_HOLD_MASK.to(device) * hold_bias
+    bias += BIAS_SLIDE_MASK.to(device) * slide_bias
+    bias += BIAS_TOUCH_MASK.to(device) * touch_bias
+    bias += BIAS_TOUCHHOLD_MASK.to(device) * touchhold_bias
+
+    logits = logits + bias.view(1, 1, -1)
+    if filter_multi_tap:
+        logits = logits.masked_fill(
+            BIAS_MULTI_TAP_MASK.to(device).view(1, 1, -1).bool(),
+            float("-inf"),
+        )
+    return logits
+
+
 def _biased_binary_predict(logits: torch.Tensor, positive_bias: float) -> torch.Tensor:
     """对二分类 logits 的正类施加偏置后取 argmax。"""
     if positive_bias:
@@ -515,11 +543,25 @@ def generate_chart(
     # ── Stage 1: 谱面骨架 (带偏置采样) ──
     progress(0.15, desc="Stage 1: 生成谱面骨架...")
     m1 = _load_model(1)
-    result1 = m1.forward(audio, beat, diff_t, lvl_t, tags_t)
-    logits1 = result1["logits"]  # (B, T, V)
-    chart = _biased_sample(logits1, temperature, top_k,
-                           density, tap_bias, hold_bias, slide_bias, touch_bias,
-                           touchhold_bias, filter_multi_tap)
+    chart = m1.generate(
+        audio,
+        beat,
+        diff_t,
+        lvl_t,
+        tags_t,
+        temperature=temperature,
+        top_k=top_k,
+        logits_processor=lambda logits: _apply_stage1_bias(
+            logits,
+            density,
+            tap_bias,
+            hold_bias,
+            slide_bias,
+            touch_bias,
+            touchhold_bias,
+            filter_multi_tap,
+        ),
+    )
     T = chart.shape[1]
     filtered_multi_tap_tokens = 0
     filtered_multi_tap_count = 0
