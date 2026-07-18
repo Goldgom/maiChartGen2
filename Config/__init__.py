@@ -34,6 +34,7 @@ class PathsConfig:
     output_dir: str = "output"
     model_dir: str = "checkpoints"
     cache_dir: str = "cache"
+    vocab_dir: str = "vocab"
 
 
 @dataclass
@@ -47,6 +48,8 @@ class TrainLoopConfig:
     max_rounds: int = 0
     max_frames: int = 0
     refine_max_frames: int = 2048
+    oom_retry_attempts: int = 3
+    oom_retry_max_frames: int = 2048
 
 
 @dataclass
@@ -93,7 +96,7 @@ class PreprocessConfig:
 class TagsConfig:
     auto_tags: str = "designer,difficulty,dx_type"
     auto_tags_file: bool = True
-    tag_vocab_path: str = "preprocessed/tag_vocab.json"
+    tag_vocab_path: str = "vocab/tag_vocab.json"
     use_collections: bool = True
     collections_dir: str = "collections"
 

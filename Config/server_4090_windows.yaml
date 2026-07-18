@@ -12,6 +12,7 @@ paths:
   output_dir: output
   model_dir: checkpoints
   cache_dir: cache
+  vocab_dir: vocab
 
 # ---- 音频 ----
 audio:
@@ -43,7 +44,7 @@ preprocess:
 tags:
   auto_tags: designer,difficulty,dx_type
   use_collections: true
-  tag_vocab_path: preprocessed/tag_vocab.json
+  tag_vocab_path: vocab/tag_vocab.json
 
 # ---- Stage 模型 (适配 16GB) ----
 stage_model:
@@ -84,6 +85,8 @@ train_loop:
   save_best_only: true
   max_frames: 0              # 0=full chart
   refine_max_frames: 2048    # Stage2-5 window to avoid T^2 OOM
+  oom_retry_attempts: 3
+  oom_retry_max_frames: 2048
   max_rounds: 0              # 0=无限循环
 
 # ---- 训练超参 ----

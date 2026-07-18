@@ -67,6 +67,7 @@ class InferenceEngine:
 
         # ── 路径 ──
         self.data_dir = cfg.preprocess.output_dir
+        self.vocab_dir = Path(getattr(cfg.paths, "vocab_dir", "vocab"))
         self.ckpt_dir = cfg.paths.model_dir
         self.output_dir = Path(cfg.paths.output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -102,7 +103,7 @@ class InferenceEngine:
     # ═══════════════════════════════════════════════════════════
 
     def _load_vocabs(self):
-        dp = Path(self.data_dir)
+        dp = self.vocab_dir
 
         with open(dp / "vocab.json", "r", encoding="utf-8") as f:
             self.vocab = json.load(f)
@@ -158,6 +159,12 @@ class InferenceEngine:
         self._multi_tap_ids = {
             v for k, v in self.vocab.items() if _count_simultaneous_taps(k) >= 3
         }
+        self._tap_counts = torch.zeros(vocab_size, dtype=torch.long)
+        self._has_touch = torch.zeros(vocab_size, dtype=torch.bool)
+        for token, tid in self.vocab.items():
+            if 0 <= tid < vocab_size:
+                self._tap_counts[tid] = _count_simultaneous_taps(token)
+                self._has_touch[tid] = _has_touch_note(token)
 
         # WiFi slide IDs
         wifi_ids = {
@@ -372,6 +379,46 @@ class InferenceEngine:
             logits = logits.masked_fill(touch_mask.view(1, 1, -1), float("-inf"))
         return logits
 
+    def _apply_stage1_constraints(
+        self,
+        logits: torch.Tensor,
+        frame_idx: int,
+        generated: torch.Tensor,
+        frame_rate: float,
+        measure_dur: float,
+        subdiv: int,
+        filter_multi_tap: bool,
+    ) -> torch.Tensor:
+        if not filter_multi_tap:
+            return logits
+
+        current_grid = _output_grid_index(frame_idx, frame_rate, measure_dur, subdiv)
+        tap_counts = self._mask_like_logits(self._tap_counts, logits).to(logits.device)
+        has_touch = self._mask_like_logits(self._has_touch.float(), logits).to(logits.device).bool()
+        note_candidate = (tap_counts > 0) | has_touch
+        masked = logits.clone()
+
+        for batch_idx in range(generated.shape[0]):
+            existing_taps = 0
+            existing_touch = False
+            for prev_frame in range(frame_idx):
+                if _output_grid_index(prev_frame, frame_rate, measure_dur, subdiv) != current_grid:
+                    continue
+                tid = int(generated[batch_idx, prev_frame].item())
+                if 0 <= tid < self._tap_counts.shape[0]:
+                    existing_taps += int(self._tap_counts[tid].item())
+                    existing_touch = existing_touch or bool(self._has_touch[tid].item())
+
+            final_taps = existing_taps + tap_counts
+            invalid = note_candidate & (
+                (final_taps >= 3) |
+                ((final_taps >= 2) & (existing_touch | has_touch))
+            )
+            if invalid.any():
+                masked[batch_idx, :, invalid] = float("-inf")
+
+        return masked
+
     # ═══════════════════════════════════════════════════════════
     # 三押过滤
     # ═══════════════════════════════════════════════════════════
@@ -384,6 +431,7 @@ class InferenceEngine:
         filtered_chart = chart.clone()
         chart_np = filtered_chart[0].detach().cpu().numpy()
         tap_counts_by_grid: dict[tuple, int] = defaultdict(int)
+        touch_by_grid: dict[tuple, bool] = defaultdict(bool)
         filtered_tokens = 0
         filtered_taps = 0
 
@@ -392,15 +440,19 @@ class InferenceEngine:
             if not token_str:
                 continue
             tap_count = _count_simultaneous_taps(token_str)
-            if tap_count <= 0:
+            has_touch = _has_touch_note(token_str)
+            if tap_count <= 0 and not has_touch:
                 continue
             grid = _output_grid_index(frame_idx, frame_rate, measure_dur, subdiv)
-            if tap_counts_by_grid[grid] + tap_count >= 3:
+            final_taps = tap_counts_by_grid[grid] + tap_count
+            final_touch = touch_by_grid[grid] or has_touch
+            if final_taps >= 3 or (final_taps >= 2 and final_touch):
                 filtered_chart[0, frame_idx] = self.empty_id
                 filtered_tokens += 1
                 filtered_taps += tap_count
                 continue
             tap_counts_by_grid[grid] += tap_count
+            touch_by_grid[grid] = final_touch
 
         return filtered_chart, filtered_tokens, filtered_taps
 
@@ -581,16 +633,24 @@ class InferenceEngine:
             audio, beat, diff_t, lvl_t, tags_t,
             temperature=temperature,
             top_k=top_k,
-            logits_processor=lambda logits: self._apply_stage1_bias(
-                logits,
-                density,
-                tap_bias,
-                hold_bias,
-                slide_bias,
-                touch_bias,
-                touchhold_bias,
+            logits_processor=lambda logits, t, generated: self._apply_stage1_constraints(
+                self._apply_stage1_bias(
+                    logits,
+                    density,
+                    tap_bias,
+                    hold_bias,
+                    slide_bias,
+                    touch_bias,
+                    touchhold_bias,
+                    filter_multi_tap,
+                    allow_touch=allow_touch,
+                ),
+                t,
+                generated,
+                fr,
+                measure_dur,
+                subdiv,
                 filter_multi_tap,
-                allow_touch=allow_touch,
             ),
         )
         T = chart.shape[1]
@@ -928,16 +988,24 @@ class InferenceEngine:
             audio, beat, diff_t, lvl_t, tags_t,
             temperature=temperature,
             top_k=top_k,
-            logits_processor=lambda logits: self._apply_stage1_bias(
-                logits,
-                density,
-                tap_bias,
-                hold_bias,
-                slide_bias,
-                touch_bias,
-                touchhold_bias,
+            logits_processor=lambda logits, t, generated: self._apply_stage1_constraints(
+                self._apply_stage1_bias(
+                    logits,
+                    density,
+                    tap_bias,
+                    hold_bias,
+                    slide_bias,
+                    touch_bias,
+                    touchhold_bias,
+                    filter_multi_tap,
+                    allow_touch=allow_touch,
+                ),
+                t,
+                generated,
+                fr,
+                measure_dur,
+                subdiv,
                 filter_multi_tap,
-                allow_touch=allow_touch,
             ),
         )
         T = chart.shape[1]
@@ -1128,9 +1196,27 @@ def _count_simultaneous_taps(token_str: str) -> int:
     tap_count = 0
     for part in token_str.split("+"):
         st = SimaiToken.from_string(part)
-        if st is not None and st.token_type == SimaiTokenType.TAP:
+        if st is None:
+            continue
+        if st.token_type == SimaiTokenType.TAP:
             tap_count += len(st.position)
+        elif st.token_type == SimaiTokenType.SLIDE:
+            tap_count += 1
+        elif st.token_type == SimaiTokenType.HOLD and re.fullmatch(r"\d+", st.position or ""):
+            tap_count += 1
     return tap_count
+
+
+def _has_touch_note(token_str: str) -> bool:
+    for part in token_str.split("+"):
+        st = SimaiToken.from_string(part)
+        if st is None:
+            continue
+        if st.token_type == SimaiTokenType.TOUCH:
+            return True
+        if st.token_type == SimaiTokenType.HOLD and re.fullmatch(r"[A-E]\d*", st.position or ""):
+            return True
+    return False
 
 
 def _is_wifi_slide_vocab_token(token: str) -> bool:

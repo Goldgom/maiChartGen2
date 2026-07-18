@@ -14,6 +14,7 @@ PreProcess — 第一阶段模型训练预处理管线
 from __future__ import annotations
 
 import json
+import shutil
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -168,6 +169,7 @@ class Preprocessor:
         self.cfg = config
         self.output_dir = Path(config.preprocess.output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.vocab_dir = Path(getattr(config.paths, "vocab_dir", "vocab"))
 
         # 全局 vocab (跨所有谱面)
         self.global_vocab: dict[str, int] = {}
@@ -269,7 +271,29 @@ class Preprocessor:
                 json.dump(self.global_slide_vocab, f, ensure_ascii=False, indent=2)
             print(f"Global slide vocab: {len(self.global_slide_vocab)} paths -> {slide_path}")
 
+        self._sync_vocab_dir()
         return output_paths
+
+    def _sync_vocab_dir(self) -> None:
+        self.vocab_dir.mkdir(parents=True, exist_ok=True)
+        copied = []
+        for name in (
+            "vocab.json",
+            "tag_vocab.json",
+            "slide_vocab.json",
+            "slide_vocab_with_timing.json",
+            "slide_path_timing_map.json",
+        ):
+            src = self.output_dir / name
+            if not src.exists():
+                continue
+            dst = self.vocab_dir / name
+            if src.resolve() == dst.resolve():
+                continue
+            shutil.copy2(src, dst)
+            copied.append(dst)
+        if copied:
+            print(f"Synced vocab files -> {self.vocab_dir} ({len(copied)} files)")
 
     def process_one(self, chart_dir: Path) -> list[PreprocessResult]:
         """处理单个谱面目录中的所有难度，返回结果列表"""

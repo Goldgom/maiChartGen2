@@ -41,6 +41,7 @@ print(f"[webui] 已加载配置: {cfg.config_name}")
 # 全局常量 (从配置读取)
 # ═══════════════════════════════════════════════════════════
 DATA_DIR = cfg.preprocess.output_dir
+VOCAB_DIR = Path(getattr(cfg.paths, "vocab_dir", "vocab"))
 CKPT_DIR = cfg.paths.model_dir
 OUTPUT_DIR = Path(cfg.paths.output_dir)
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -61,15 +62,15 @@ DIFF_MAP = {d: i + 1 for i, d in enumerate(DIFFICULTIES)}
 DIFF_ID = {d: i for i, d in enumerate(DIFFICULTIES)}
 
 # 加载词表
-with open(f"{DATA_DIR}/vocab.json", "r", encoding="utf-8") as f:
+with open(VOCAB_DIR / "vocab.json", "r", encoding="utf-8") as f:
     VOCAB = json.load(f)
 ID_TO_TOKEN = {v: k for k, v in VOCAB.items()}
 
-with open(f"{DATA_DIR}/tag_vocab.json", "r", encoding="utf-8") as f:
+with open(VOCAB_DIR / "tag_vocab.json", "r", encoding="utf-8") as f:
     TAG_VOCAB = json.load(f)  # {tag_string: id}
 
 # 加载 slide vocab
-slide_vocab_path = Path(DATA_DIR) / "slide_vocab.json"
+slide_vocab_path = VOCAB_DIR / "slide_vocab.json"
 if slide_vocab_path.exists():
     SLIDE_VOCAB = json.loads(slide_vocab_path.read_text("utf-8"))
 else:
@@ -88,7 +89,7 @@ _WIFI_SLIDE_IDS = {
 }
 
 # 加载 path → best_timing 映射 (从训练数据统计)
-_timing_map_path = Path(DATA_DIR) / "slide_path_timing_map.json"
+_timing_map_path = VOCAB_DIR / "slide_path_timing_map.json"
 if _timing_map_path.exists():
     PATH_BEST_TIMING = json.loads(_timing_map_path.read_text("utf-8"))
 else:
@@ -129,15 +130,39 @@ def _count_simultaneous_taps(token_str: str) -> int:
     tap_count = 0
     for part in token_str.split("+"):
         st = SimaiToken.from_string(part)
-        if st is not None and st.token_type == SimaiTokenType.TAP:
+        if st is None:
+            continue
+        if st.token_type == SimaiTokenType.TAP:
             tap_count += len(st.position)
+        elif st.token_type == SimaiTokenType.SLIDE:
+            tap_count += 1
+        elif st.token_type == SimaiTokenType.HOLD and re.fullmatch(r"\d+", st.position or ""):
+            tap_count += 1
     return tap_count
+
+
+def _has_touch_note(token_str: str) -> bool:
+    for part in token_str.split("+"):
+        st = SimaiToken.from_string(part)
+        if st is None:
+            continue
+        if st.token_type == SimaiTokenType.TOUCH:
+            return True
+        if st.token_type == SimaiTokenType.HOLD and re.fullmatch(r"[A-E]\d*", st.position or ""):
+            return True
+    return False
 
 
 _MULTI_TAP_IDS = {
     v for k, v in VOCAB.items()
     if _count_simultaneous_taps(k) >= 3
 }
+TAP_COUNTS_BY_ID = torch.zeros(VOCAB_SIZE, dtype=torch.long)
+HAS_TOUCH_BY_ID = torch.zeros(VOCAB_SIZE, dtype=torch.bool)
+for _token, _tid in VOCAB.items():
+    if 0 <= _tid < VOCAB_SIZE:
+        TAP_COUNTS_BY_ID[_tid] = _count_simultaneous_taps(_token)
+        HAS_TOUCH_BY_ID[_tid] = _has_touch_note(_token)
 
 # 构建偏置掩码张量 (device 无关, 使用时 .to(device))
 def _build_mask(id_set: set, vocab_size: int) -> torch.Tensor:
@@ -187,6 +212,7 @@ def _filter_multi_tap_chart(
     filtered_chart = chart.clone()
     chart_np = filtered_chart[0].detach().cpu().numpy()
     tap_counts_by_grid: dict[tuple[int, int], int] = defaultdict(int)
+    touch_by_grid: dict[tuple[int, int], bool] = defaultdict(bool)
     filtered_tokens = 0
     filtered_taps = 0
 
@@ -196,17 +222,21 @@ def _filter_multi_tap_chart(
             continue
 
         tap_count = _count_simultaneous_taps(token_str)
-        if tap_count <= 0:
+        has_touch = _has_touch_note(token_str)
+        if tap_count <= 0 and not has_touch:
             continue
 
         grid_idx = _output_grid_index(frame_idx, frame_rate, measure_dur, subdiv)
-        if tap_counts_by_grid[grid_idx] + tap_count >= 3:
+        final_taps = tap_counts_by_grid[grid_idx] + tap_count
+        final_touch = touch_by_grid[grid_idx] or has_touch
+        if final_taps >= 3 or (final_taps >= 2 and final_touch):
             filtered_chart[0, frame_idx] = EMPTY_ID
             filtered_tokens += 1
             filtered_taps += tap_count
             continue
 
         tap_counts_by_grid[grid_idx] += tap_count
+        touch_by_grid[grid_idx] = final_touch
 
     return filtered_chart, filtered_tokens, filtered_taps
 
@@ -349,6 +379,46 @@ def _apply_stage1_bias(
             float("-inf"),
         )
     return logits
+
+
+def _apply_stage1_constraints(
+    logits: torch.Tensor,
+    frame_idx: int,
+    generated: torch.Tensor,
+    frame_rate: float,
+    measure_dur: float,
+    subdiv: int,
+    filter_multi_tap: bool,
+) -> torch.Tensor:
+    if not filter_multi_tap:
+        return logits
+
+    current_grid = _output_grid_index(frame_idx, frame_rate, measure_dur, subdiv)
+    tap_counts = _mask_like_logits(TAP_COUNTS_BY_ID, logits).to(logits.device)
+    has_touch = _mask_like_logits(HAS_TOUCH_BY_ID.float(), logits).to(logits.device).bool()
+    note_candidate = (tap_counts > 0) | has_touch
+    masked = logits.clone()
+
+    for batch_idx in range(generated.shape[0]):
+        existing_taps = 0
+        existing_touch = False
+        for prev_frame in range(frame_idx):
+            if _output_grid_index(prev_frame, frame_rate, measure_dur, subdiv) != current_grid:
+                continue
+            tid = int(generated[batch_idx, prev_frame].item())
+            if 0 <= tid < TAP_COUNTS_BY_ID.shape[0]:
+                existing_taps += int(TAP_COUNTS_BY_ID[tid].item())
+                existing_touch = existing_touch or bool(HAS_TOUCH_BY_ID[tid].item())
+
+        final_taps = existing_taps + tap_counts
+        invalid = note_candidate & (
+            (final_taps >= 3) |
+            ((final_taps >= 2) & (existing_touch | has_touch))
+        )
+        if invalid.any():
+            masked[batch_idx, :, invalid] = float("-inf")
+
+    return masked
 
 
 def _biased_binary_predict(logits: torch.Tensor, positive_bias: float) -> torch.Tensor:
@@ -551,14 +621,22 @@ def generate_chart(
         tags_t,
         temperature=temperature,
         top_k=top_k,
-        logits_processor=lambda logits: _apply_stage1_bias(
-            logits,
-            density,
-            tap_bias,
-            hold_bias,
-            slide_bias,
-            touch_bias,
-            touchhold_bias,
+        logits_processor=lambda logits, t, generated: _apply_stage1_constraints(
+            _apply_stage1_bias(
+                logits,
+                density,
+                tap_bias,
+                hold_bias,
+                slide_bias,
+                touch_bias,
+                touchhold_bias,
+                filter_multi_tap,
+            ),
+            t,
+            generated,
+            fr,
+            measure_dur,
+            subdiv,
             filter_multi_tap,
         ),
     )

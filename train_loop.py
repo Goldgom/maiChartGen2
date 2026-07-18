@@ -170,26 +170,31 @@ class ChartDataset(torch.utils.data.Dataset):
         return len(self.files)
 
     def __getitem__(self, idx):
-        path = self.files[idx]
+        return self._load_item(self.files[idx])
+
+    def _load_item(self, path, forced_start: int | None = None, window_frames: int | None = None):
         data = np.load(path)
         meta_path = path.with_suffix(".json")
         meta = json.loads(meta_path.read_text("utf-8")) if meta_path.exists() else {"metadata": {}}
         metadata = meta.get("metadata", {})
         T = data["audio_tokens"].shape[0]
+        max_frames = self.max_frames if window_frames is None else int(window_frames)
         frame_labels = None
-        if self.max_frames and self.max_frames > 0 and T > self.max_frames:
-            if self.random_crop:
-                start = np.random.randint(0, T - self.max_frames + 1)
+        if max_frames and max_frames > 0 and T > max_frames:
+            if forced_start is not None:
+                start = int(max(0, min(T - max_frames, forced_start)))
+            elif self.random_crop:
+                start = np.random.randint(0, T - max_frames + 1)
             elif self.use_timing_slide:
                 frame_labels = self._extract_slide_frame_labels(meta_path)
                 if frame_labels:
                     first_slide = min(frame_labels)
-                    start = max(0, min(T - self.max_frames, first_slide - self.max_frames // 2))
+                    start = max(0, min(T - max_frames, first_slide - max_frames // 2))
                 else:
                     start = 0
             else:
                 start = 0
-            end = start + self.max_frames
+            end = start + max_frames
         else:
             start = 0
             end = T
@@ -217,7 +222,16 @@ class ChartDataset(torch.utils.data.Dataset):
             "difficulty": np.array(self.diff_map.get(diff_name, 3), dtype=np.int64),
             "level": np.array(float(metadata.get("level", 10.0)), dtype=np.float32),
             "tags": padded_tags,
+            "path": str(path),
+            "song_id": path.stem,
+            "difficulty_name": diff_name,
+            "start": int(start),
+            "end": int(end),
+            "total_frames": int(T),
         }
+
+    def reload_with_window(self, item, start: int, window_frames: int):
+        return self._load_item(Path(item["path"]), forced_start=start, window_frames=window_frames)
 
     def _extract_slide_frame_labels(self, meta_path):
         try:
@@ -283,6 +297,7 @@ def collate(batch):
     diff_b = torch.zeros(B, dtype=torch.long)
     lvl_b = torch.zeros(B)
     tags_b = torch.full((B, 32), -1, dtype=torch.long)
+    metas = []
     for i, item in enumerate(batch):
         t = item["audio"].shape[0]
         c = item["audio"].shape[1]
@@ -313,7 +328,15 @@ def collate(batch):
         diff_b[i] = int(item["difficulty"])
         lvl_b[i] = float(item["level"])
         tags_b[i] = torch.from_numpy(item["tags"])
-    return audio_b, beat_b, chart_b, brk_b, ex_b, obj_b, hold_b, slide_b, diff_b, lvl_b, tags_b, valid_b
+        metas.append({
+            "path": item.get("path", ""),
+            "song_id": item.get("song_id", ""),
+            "difficulty_name": item.get("difficulty_name", ""),
+            "start": int(item.get("start", 0)),
+            "end": int(item.get("end", t)),
+            "total_frames": int(item.get("total_frames", t)),
+        })
+    return audio_b, beat_b, chart_b, brk_b, ex_b, obj_b, hold_b, slide_b, diff_b, lvl_b, tags_b, valid_b, metas
 
 
 # ═══════════════════════════════════════════════════════════
@@ -325,6 +348,7 @@ class Trainer:
         self.cfg = cfg
         self.device = device
         self.data_dir = Path(cfg.preprocess.output_dir)
+        self.vocab_dir = Path(getattr(cfg.paths, "vocab_dir", "vocab"))
         self.ckpt_dir = Path(cfg.paths.model_dir)
         self.ckpt_dir.mkdir(parents=True, exist_ok=True)
         self.vocab = {}
@@ -334,17 +358,17 @@ class Trainer:
     def _init_data(self):
         """加载数据 + vocab (在 run 中调用, 确保预处理已完成)"""
         self.data_dir.mkdir(parents=True, exist_ok=True)
-        with open(self.data_dir / "vocab.json", "r", encoding="utf-8") as f:
+        with open(self.vocab_dir / "vocab.json", "r", encoding="utf-8") as f:
             self.vocab = json.load(f)
-        slide_vocab_path = self.data_dir / "slide_vocab_with_timing.json"
+        slide_vocab_path = self.vocab_dir / "slide_vocab_with_timing.json"
         if not slide_vocab_path.exists():
-            slide_vocab_path = self.data_dir / "slide_vocab.json"
+            slide_vocab_path = self.vocab_dir / "slide_vocab.json"
         if slide_vocab_path.exists():
             with open(slide_vocab_path, "r", encoding="utf-8") as f:
                 self.slide_vocab = json.load(f)
         else:
             self.slide_vocab = {"<PAD>": 0}
-        tag_vocab_path = self.data_dir / "tag_vocab.json"
+        tag_vocab_path = self.vocab_dir / "tag_vocab.json"
         if tag_vocab_path.exists():
             with open(tag_vocab_path, "r", encoding="utf-8") as f:
                 self.tag_vocab = json.load(f)
@@ -515,7 +539,9 @@ class Trainer:
         return float(optimizer.param_groups[0].get("lr", 0.0))
 
     def compute_loss(self, model, batch, stage: int):
-        audio, beat, chart, brk, ex, obj_mask, hold_dur, slide_path, diff, lvl, tags, valid = [x.to(self.device) for x in batch]
+        audio, beat, chart, brk, ex, obj_mask, hold_dur, slide_path, diff, lvl, tags, valid = [
+            x.to(self.device) for x in batch[:12]
+        ]
 
         if stage == 1:
             logits = model(audio, beat, diff, lvl, tags, chart_tokens=chart)["logits"]
@@ -587,6 +613,50 @@ class Trainer:
             log(f"  -> saved stage{stage}_last.pt")
         else:
             log(f"  -> saved stage{stage}_last.pt (val_loss={val_loss:.4f})")
+
+    def _is_cuda_oom(self, exc: BaseException) -> bool:
+        if isinstance(exc, getattr(torch.cuda, "OutOfMemoryError", RuntimeError)):
+            return True
+        msg = str(exc).lower()
+        return "cuda" in msg and "out of memory" in msg
+
+    def _batch_meta_summary(self, batch) -> str:
+        metas = batch[12] if len(batch) > 12 else []
+        if not metas:
+            return "unknown batch"
+        parts = []
+        for meta in metas:
+            song_id = meta.get("song_id") or Path(meta.get("path", "")).stem or "unknown"
+            diff = meta.get("difficulty_name") or "Unknown"
+            parts.append(
+                f"{song_id}/{diff} frames={meta.get('start', 0)}:"
+                f"{meta.get('end', 0)}/{meta.get('total_frames', 0)}"
+            )
+        return "; ".join(parts)
+
+    def _oom_retry_batch(self, batch, dataset: ChartDataset, attempt: int):
+        retry_max = int(getattr(self.cfg.train_loop, "oom_retry_max_frames", 2048))
+        current_frames = int(batch[0].shape[1])
+        if retry_max <= 0:
+            retry_max = max(1, current_frames // 2)
+        target_frames = min(current_frames, retry_max)
+        if attempt > 1:
+            target_frames = int(target_frames * (0.75 ** (attempt - 1)))
+        target_frames = min(current_frames, max(128, target_frames))
+
+        metas = batch[12] if len(batch) > 12 else []
+        if not metas:
+            return batch
+
+        items = []
+        for meta in metas:
+            total = int(meta.get("total_frames", current_frames))
+            max_start = max(0, total - target_frames)
+            start = int(np.random.randint(0, max_start + 1)) if max_start > 0 else 0
+            items.append(dataset.reload_with_window(meta, start, target_frames))
+        retry_batch = collate(items)
+        log(f"  OOM retry {attempt}: new_window={target_frames} | {self._batch_meta_summary(retry_batch)}")
+        return retry_batch
 
     def run(self):
         global _should_stop
@@ -677,9 +747,32 @@ class Trainer:
                     optimizer.zero_grad(set_to_none=True)
                     for batch in train_loader:
                         if _should_stop: break
-                        loss = self.compute_loss(model, batch, stage)
+                        loss = None
+                        retry_batch = batch
+                        max_oom_retries = max(0, int(getattr(self.cfg.train_loop, "oom_retry_attempts", 3)))
+                        oom_attempt = 0
+                        while True:
+                            try:
+                                loss = self.compute_loss(model, retry_batch, stage)
+                                if loss is not None:
+                                    (loss / grad_accum).backward()
+                                batch = retry_batch
+                                break
+                            except RuntimeError as e:
+                                if not self._is_cuda_oom(e):
+                                    raise
+                                oom_attempt += 1
+                                log(f"  CUDA OOM at stage={stage}: {self._batch_meta_summary(retry_batch)}")
+                                optimizer.zero_grad(set_to_none=True)
+                                model.zero_grad(set_to_none=True)
+                                accum_steps = 0
+                                if self.device == "cuda":
+                                    torch.cuda.empty_cache()
+                                if oom_attempt > max_oom_retries:
+                                    log(f"  OOM retries exhausted ({max_oom_retries}); aborting batch")
+                                    raise
+                                retry_batch = self._oom_retry_batch(batch, train_ds, oom_attempt)
                         if loss is None: continue
-                        (loss / grad_accum).backward()
                         epoch_loss += loss.item(); n_steps += 1
                         self.global_step += 1; steps += 1
                         accum_steps += 1
