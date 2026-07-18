@@ -3,6 +3,7 @@ paths:
   output_dir: output
   model_dir: checkpoints
   cache_dir: cache
+  vocab_dir: vocab
 audio:
   model_id: facebook/encodec_24khz
   premodel_path: ""
@@ -34,7 +35,7 @@ preprocess:
 tags:
   auto_tags: designer,difficulty,dx_type
   auto_tags_file: true
-  tag_vocab_path: preprocessed/tag_vocab.json
+  tag_vocab_path: vocab/tag_vocab.json
   use_collections: true
   collections_dir: collections
 data:
@@ -111,6 +112,8 @@ train_loop:
   max_rounds: 0
   max_frames: 0
   refine_max_frames: 2048
+  oom_retry_attempts: 3
+  oom_retry_max_frames: 2048
 logging:
   log_dir: logs
   log_every_steps: 100

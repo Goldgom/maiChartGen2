@@ -24,7 +24,7 @@ from models.common import (
 )
 
 
-LogitsProcessor = Callable[[torch.Tensor], torch.Tensor]
+LogitsProcessor = Callable[..., torch.Tensor]
 
 
 class Stage1ChartModel(nn.Module):
@@ -177,7 +177,10 @@ class Stage1ChartModel(nn.Module):
             )
             logits = out["logits"][:, t:t + 1, :]
             if logits_processor is not None:
-                logits = logits_processor(logits)
+                try:
+                    logits = logits_processor(logits, t, generated)
+                except TypeError:
+                    logits = logits_processor(logits)
             if temperature > 0:
                 logits = logits / temperature
             if top_k > 0 and top_k < logits.shape[-1]:

@@ -32,6 +32,11 @@ paths:
     :range: "任意有效路径"
     :value: "cache"
 
+  vocab_dir:
+    :description: "vocab JSON directory"
+    :range: "any valid path"
+    :value: "vocab"
+
 # ---- 音频 Tokenizer (EnCodec) ---------------------------------
 audio:
   model_id:
@@ -175,7 +180,7 @@ tags:
   tag_vocab_path:
     :description: "标签词汇表保存路径"
     :range: "路径"
-    :value: "preprocessed/tag_vocab.json"
+    :value: "vocab/tag_vocab.json"
 
   use_collections:
     :description: "是否从 collections/*/manifest.json 读取集合标签"
@@ -484,6 +489,16 @@ train_loop:
   refine_max_frames:
     :description: "Stage2-5 max frames per sample; finite window avoids T^2 attention OOM"
     :range: ">= 0"
+    :value: 2048
+
+  oom_retry_attempts:
+    :description: "CUDA OOM retry attempts for one training batch"
+    :range: ">= 0"
+    :value: 3
+
+  oom_retry_max_frames:
+    :description: "Max frames used when retrying a batch after CUDA OOM"
+    :range: ">= 1"
     :value: 2048
 
 logging:
