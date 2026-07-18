@@ -1,0 +1,172 @@
+paths:
+  datasets_dir: datasets
+  output_dir: output
+  model_dir: checkpoints
+  cache_dir: cache
+audio:
+  model_id: facebook/encodec_24khz
+  premodel_path: ""
+  num_codebooks: 8
+  device: cpu
+  frame_rate: null
+chart:
+  max_difficulty: 6
+  include_empty_measures: false
+  add_eos_token: true
+  target_subdiv: 4
+beat:
+  method: librosa
+  bpm_min: 60
+  bpm_max: 240
+  tightness: 50
+  time_signature: 4
+  downbeat_weight: 1.5
+  quantize_beats: true
+  use_chart_bpm: true
+preprocess:
+  output_dir: preprocessed
+  audio_codebooks: 8
+  beat_method: librosa
+  beat_as_binary: true
+  frame_rate: 0
+  max_charts: 0
+  skip_existing: true
+tags:
+  auto_tags: designer,difficulty,dx_type
+  auto_tags_file: true
+  tag_vocab_path: preprocessed/tag_vocab.json
+  use_collections: true
+  collections_dir: collections
+data:
+  train_split: 0.85
+  val_split: 0.1
+  max_audio_duration: 180.0
+  min_audio_duration: 30.0
+  shuffle_seed: 42
+  num_workers: 2
+model:
+  model_type: transformer
+  d_model: 512
+  n_head: 8
+  n_layer: 6
+  n_audio_codebooks: 8
+  audio_vocab_size: 1024
+  chart_vocab_size: 512
+  max_seq_len: 8192
+  dropout: 0.1
+  use_cross_attention: true
+stage_model:
+  model_type: transformer
+  d_model: 512
+  n_head: 8
+  n_layer: 6
+  d_ff: 2048
+  dropout: 0.1
+  hold_dur_bins: 64
+  max_hold_slots: 8
+  max_slide_slots: 8
+  max_object_slots: 16
+  slot_n_layer: 2
+  global_tag_scale: 1.0
+  dynamic_tag_scale: 1.0
+  slide_vocab_size: 256
+stage1_model:
+  n_layer: 6
+stage2_model:
+  n_layer: 4
+stage3_model:
+  n_layer: 4
+stage4_model:
+  n_layer: 3
+stage5_model:
+  n_layer: 3
+training:
+  batch_size: 8
+  gradient_accumulation_steps: 4
+  learning_rate: 0.0001
+  min_learning_rate: 1.0e-06
+  warmup_steps: 1000
+  max_epochs: 100
+  optimizer: adamw
+  weight_decay: 0.01
+  betas:
+  - 0.9
+  - 0.999
+  scheduler: cosine
+  grad_clip: 1.0
+  save_every_epochs: 5
+  early_stopping_patience: 20
+stage1_training: {}
+stage2_training: {}
+stage3_training: {}
+stage4_training: {}
+stage5_training: {}
+train_loop:
+  mode: stage_epochs
+  start_stage: 1
+  epochs_per_stage: 5
+  val_samples_per_difficulty: 25
+  val_check_interval: 200
+  save_best_only: true
+  max_rounds: 0
+  max_frames: 0
+  refine_max_frames: 2048
+logging:
+  log_dir: logs
+  log_every_steps: 100
+  use_wandb: false
+  wandb_project: maiChartGen3
+generation:
+  temperature: 0.8
+  top_k: 50
+  top_p: 0.95
+  repetition_penalty: 1.1
+  max_new_tokens: 4096
+  do_sample: true
+  num_beams: 1
+batch_infer:
+  input_dir: samples
+  output_dir: output/batch
+  audio_extensions:
+    - ".mp3"
+    - ".wav"
+    - ".ogg"
+    - ".flac"
+  video_extensions:
+    - ".mp4"
+    - ".webm"
+    - ".mkv"
+  output_subdir_template: "{input_name}"
+  difficulties:
+    - name: "Master"
+      level: 13.0
+  designer: "AI"
+  collections:
+    - "Original"
+    - "niconicoボーカロイド"
+    - "POPSアニメ"
+    - "翠楼屋"
+    - "DX Chart"
+    - "maimai DX CiRCLE"
+  bpm_override: 0
+  density: 0.0
+  tap_bias: 0.0
+  hold_bias: 0.0
+  slide_bias: 0.0
+  wifi_bias: 0.0
+  touch_bias: 0.0
+  touchhold_bias: 0.0
+  break_bias: 0.0
+  top_k: 50
+  filter_multi_tap: true
+  allow_touch: false
+  beat_method: "librosa"
+  skip_stages:
+    - "Stage 5"
+  copy_audio: true
+  audio_format: "mp3"
+  audio_bitrate: "192k"
+  copy_video: true
+  extract_bg: true
+  bg_max_size: 512
+  skip_existing: false

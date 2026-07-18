@@ -1,0 +1,276 @@
+# ============================================================
+# maiChartGen3 Windows 本机测试配置 (RTX 4090 / 24GB VRAM)
+# ============================================================
+# 使用: python train_loop.py --config server_4090_windows
+# 基于 server_4090.yaml, 路径适配 Windows 环境
+#
+# 保守估算: 16GB 显存
+# 实际 4090 有 24GB, 留 8GB 余量用于 EnCodec/beat_this 等
+
+paths:
+  datasets_dir: datasets
+  output_dir: output
+  model_dir: checkpoints
+  cache_dir: cache
+
+# ---- 音频 ----
+audio:
+  model_id: facebook/encodec_24khz
+  premodel_path: "premodels/encodec_24khz"
+  num_codebooks: 8          # 8 codebook 完整频谱
+  device: cuda
+
+# ---- 谱面 ----
+chart:
+  max_difficulty: 6
+  target_subdiv: 32         # 32 分拍 (更精细的时序分辨率)
+
+# ---- 节拍 ----
+beat:
+  method: librosa
+  use_chart_bpm: true
+
+# ---- 预处理 ----
+preprocess:
+  output_dir: preprocessed
+  audio_codebooks: 8
+  beat_method: librosa
+  frame_rate: 0
+  max_charts: 0
+  skip_existing: true
+
+# ---- 标签 ----
+tags:
+  auto_tags: designer,difficulty,dx_type
+  use_collections: true
+  tag_vocab_path: preprocessed/tag_vocab.json
+
+# ---- Stage 模型 (适配 16GB) ----
+stage_model:
+  model_type: transformer
+  d_model: 512               # 模型宽度
+  n_head: 8                  # 注意力头
+  n_layer: 6                 # Transformer 层数
+  d_ff: 2048                 # FF 中间维度
+  dropout: 0.1
+  hold_dur_bins: 64
+  slot_n_layer: 2
+  global_tag_scale: 1.0
+  dynamic_tag_scale: 1.0
+  slide_vocab_size: 512
+
+# ---- 训练循环 ----
+stage1_model:
+  n_layer: 6
+
+stage2_model:
+  n_layer: 6
+
+stage3_model:
+  n_layer: 6
+
+stage4_model:
+  n_layer: 6
+
+stage5_model:
+  n_layer: 6
+
+train_loop:
+  mode: stage_epochs          # stage_epochs=每个stage跑N epoch; round_robin=每个stage跑1 epoch循环
+  start_stage: 1
+  epochs_per_stage: 5
+  val_samples_per_difficulty: 25
+  val_check_interval: 500    # 每 500 step 验证
+  save_best_only: true
+  max_frames: 0              # 0=full chart
+  refine_max_frames: 2048    # Stage2-5 window to avoid T^2 OOM
+  max_rounds: 0              # 0=无限循环
+
+# ---- 训练超参 ----
+training:
+  batch_size: 4              # 单卡 4090 subdiv=32 保守 4
+  gradient_accumulation_steps: 4   # 有效 batch = 4×4 = 16
+  learning_rate: 0.0003
+  min_learning_rate: 0.000001
+  warmup_steps: 2000
+  max_epochs: 100
+  optimizer: adamw
+  weight_decay: 0.01
+  scheduler: cosine
+  grad_clip: 1.0
+
+# ---- 分 Stage 训练超参 (未写字段会继承 training) ----
+stage1_training:
+  batch_size: 1              
+  gradient_accumulation_steps: 8  
+  learning_rate: 0.0003
+  warmup_steps: 2000
+
+stage2_training:
+  learning_rate: 0.0002
+  warmup_steps: 1500
+
+stage3_training:
+  learning_rate: 0.0001
+  warmup_steps: 3000
+  gradient_accumulation_steps: 4
+
+stage4_training:
+  learning_rate: 0.0002
+  warmup_steps: 1500
+
+stage5_training:
+  learning_rate: 0.0002
+  warmup_steps: 1500
+
+# ---- 模型 (全局, 用于向下兼容) ----
+model:
+  d_model: 512
+  n_head: 8
+  n_layer: 6
+  n_audio_codebooks: 8
+  max_seq_len: 4096
+  dropout: 0.1
+  use_cross_attention: true
+
+# ---- 日志 ----
+logging:
+  log_dir: logs
+  log_every_steps: 100
+  use_wandb: true
+  wandb_project: maiChartGen3
+
+# ---- 生成 ----
+generation:
+  temperature: 0.8
+  top_k: 50
+  top_p: 0.95
+
+# ---- WebUI 服务器 ----
+server:
+  host: "0.0.0.0"
+  port: 20202
+  share: false
+  inbrowser: true
+
+# ---- 批量推理 ----
+batch_infer:
+  input_dir: samples
+  output_dir: output/batch
+  audio_extensions:
+    - ".mp3"
+    - ".wav"
+    - ".ogg"
+    - ".flac"
+  video_extensions:
+    - ".mp4"
+    - ".webm"
+    - ".mkv"
+  output_subdir_template: "{input_name}"
+
+  # ── 难度列表 (每个难度可独立覆盖全局参数) ──
+  difficulties:
+    - name: "Basic"
+      level: 6.0
+      density: 0.1        # 极低密度
+      tap_bias: 0.1
+      hold_bias: 0
+      slide_bias: 1.0
+      touch_bias: 2.0
+      touchhold_bias: 2.0
+      temperature: 0.7     # 低温稳定
+      top_k: 30
+      break_bias: 1.0
+      filter_multi_tap: true
+      skip_stages:
+        - "Stage 5"
+
+    - name: "Advanced"
+      level: 10.0
+      density: 0.95        # 低密度, 简洁
+      tap_bias: 0.3
+      hold_bias: 0.5
+      slide_bias: 1.5
+      touch_bias: 2.0
+      touchhold_bias: 2.5
+      temperature: 0.6     # 低温度 = 更稳定
+      break_bias: 1.3
+      filter_multi_tap: true
+      skip_stages:
+        - "Stage 5"
+
+    - name: "Expert"
+      level: 12.5
+      density: 1.58         # 中等密度
+      tap_bias: 0.48
+      hold_bias: 0.1
+      slide_bias: 1.0
+      touch_bias: 2.5
+      touchhold_bias: 2.6
+      temperature: 0.5
+      break_bias: 1.4
+      filter_multi_tap: true
+      skip_stages:
+        - "Stage 5"
+
+    - name: "Master"
+      level: 13.5
+      density: 1.68       # 中等密度
+      tap_bias: 0.95
+      hold_bias: 0.85
+      slide_bias: 0.75
+      touch_bias: 2.5
+      touchhold_bias: 2.8
+      temperature: 0.35
+      break_bias: 2
+      filter_multi_tap: true
+      skip_stages:
+        - "Stage 5"
+
+    - name: "Re:Master"
+      level: 14.5
+      density: 1.78       # 中等密度
+      tap_bias: 0.9
+      hold_bias: 0.85
+      slide_bias: 0.9
+      touch_bias: 3
+      touchhold_bias: 2.6
+      temperature: 0.3
+      break_bias: 2.5
+      filter_multi_tap: true
+      skip_stages:
+        - "Stage 5"
+
+  designer: "AI"
+  collections:
+    - "Original"
+    - "niconicoボーカロイド"
+    - "POPSアニメ"
+    - "翠楼屋"
+    - "DX Chart"
+    - "maimai DX CiRCLE"
+
+  # ── 全局默认参数 (各难度未覆盖时使用) ──
+  bpm_override: 0
+  density: 0.0
+  tap_bias: 0.0
+  hold_bias: 0.0
+  slide_bias: 0.0
+  wifi_bias: 2
+  touch_bias: 0.0
+  touchhold_bias: 0.0
+  break_bias: 0.0
+  top_k: 100
+  filter_multi_tap: true
+  allow_touch: true
+  beat_method: "librosa"
+  skip_stages:
+    - "Stage 5"
+
+  copy_audio: true
+  audio_format: "mp3"
+  audio_bitrate: "192k"
+  copy_video: true
+  extract_bg: true
+  bg_max_size: 512
+  skip_existing: true

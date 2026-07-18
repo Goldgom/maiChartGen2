@@ -42,3 +42,5 @@ web_outputs/
 .DS_Store
 
 debug
+samples
+output
