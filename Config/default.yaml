@@ -144,17 +144,229 @@ batch_infer:
     - ".webm"
     - ".mkv"
   output_subdir_template: "{input_name}"
+
+  # 每个难度都可以单独覆盖全局参数
   difficulties:
+    - name: "Easy"
+      level: 3.0
+      designer: "AI"
+      collections:
+        - "Original"
+        - "niconicoボーカロイド"
+        - "POPSアニメ"
+        - "東方Project"
+        - "DX Chart"
+        - "maimai DX CiRCLE"
+      temperature: 0.8
+      top_k: 50
+      bpm_override: 0.0
+      density: 0.0
+      empty_penalty_start: 32
+      empty_penalty_per_frame: 0.08
+      tap_bias: 0.0
+      hold_bias: 0.0
+      slide_bias: 0.0
+      wifi_bias: 0.0
+      touch_bias: 0.0
+      touchhold_bias: 0.0
+      break_bias: 0.0
+      filter_multi_tap: true
+      allow_touch: false
+      beat_method: "librosa"
+      skip_stages:
+        - "Stage 5"
+      memory_mode: "per_stage"
+
+    - name: "Basic"
+      level: 6.0
+      designer: "AI"
+      collections:
+        - "Original"
+        - "niconicoボーカロイド"
+        - "POPSアニメ"
+        - "東方Project"
+        - "DX Chart"
+        - "maimai DX CiRCLE"
+      temperature: 0.8
+      top_k: 50
+      bpm_override: 0.0
+      density: 0.0
+      empty_penalty_start: 32
+      empty_penalty_per_frame: 0.08
+      tap_bias: 0.0
+      hold_bias: 0.0
+      slide_bias: 0.0
+      wifi_bias: 0.0
+      touch_bias: 0.0
+      touchhold_bias: 0.0
+      break_bias: 0.0
+      filter_multi_tap: true
+      allow_touch: false
+      beat_method: "librosa"
+      skip_stages:
+        - "Stage 5"
+      memory_mode: "per_stage"
+
+    - name: "Advanced"
+      level: 9.0
+      designer: "AI"
+      collections:
+        - "Original"
+        - "niconicoボーカロイド"
+        - "POPSアニメ"
+        - "東方Project"
+        - "DX Chart"
+        - "maimai DX CiRCLE"
+      temperature: 0.8
+      top_k: 50
+      bpm_override: 0.0
+      density: 0.0
+      empty_penalty_start: 32
+      empty_penalty_per_frame: 0.08
+      tap_bias: 0.0
+      hold_bias: 0.0
+      slide_bias: 0.0
+      wifi_bias: 0.0
+      touch_bias: 0.0
+      touchhold_bias: 0.0
+      break_bias: 0.0
+      filter_multi_tap: true
+      allow_touch: false
+      beat_method: "librosa"
+      skip_stages:
+        - "Stage 5"
+      memory_mode: "per_stage"
+
+    - name: "Expert"
+      level: 12.0
+      designer: "AI"
+      collections:
+        - "Original"
+        - "niconicoボーカロイド"
+        - "POPSアニメ"
+        - "東方Project"
+        - "DX Chart"
+        - "maimai DX CiRCLE"
+      temperature: 0.8
+      top_k: 50
+      bpm_override: 0.0
+      density: 0.0
+      empty_penalty_start: 32
+      empty_penalty_per_frame: 0.08
+      tap_bias: 0.0
+      hold_bias: 0.0
+      slide_bias: 0.0
+      wifi_bias: 0.0
+      touch_bias: 0.0
+      touchhold_bias: 0.0
+      break_bias: 0.0
+      filter_multi_tap: true
+      allow_touch: false
+      beat_method: "librosa"
+      skip_stages:
+        - "Stage 5"
+      memory_mode: "per_stage"
+
     - name: "Master"
+      level: 13.5
+      designer: "AI"
+      collections:
+        - "Original"
+        - "niconicoボーカロイド"
+        - "POPSアニメ"
+        - "東方Project"
+        - "DX Chart"
+        - "maimai DX CiRCLE"
+      temperature: 0.8
+      top_k: 50
+      bpm_override: 0.0
+      density: 0.0
+      empty_penalty_start: 32
+      empty_penalty_per_frame: 0.08
+      tap_bias: 0.0
+      hold_bias: 0.0
+      slide_bias: 0.0
+      wifi_bias: 0.0
+      touch_bias: 0.0
+      touchhold_bias: 0.0
+      break_bias: 0.0
+      filter_multi_tap: true
+      allow_touch: false
+      beat_method: "librosa"
+      skip_stages:
+        - "Stage 5"
+      memory_mode: "per_stage"
+
+    - name: "Re:Master"
+      level: 14.5
+      designer: "AI"
+      collections:
+        - "Original"
+        - "niconicoボーカロイド"
+        - "POPSアニメ"
+        - "東方Project"
+        - "DX Chart"
+        - "maimai DX CiRCLE"
+      temperature: 0.8
+      top_k: 50
+      bpm_override: 0.0
+      density: 0.0
+      empty_penalty_start: 32
+      empty_penalty_per_frame: 0.08
+      tap_bias: 0.0
+      hold_bias: 0.0
+      slide_bias: 0.0
+      wifi_bias: 0.0
+      touch_bias: 0.0
+      touchhold_bias: 0.0
+      break_bias: 0.0
+      filter_multi_tap: true
+      allow_touch: false
+      beat_method: "librosa"
+      skip_stages:
+        - "Stage 5"
+      memory_mode: "per_stage"
+
+    - name: "UTAGE"
       level: 13.0
+      designer: "AI"
+      collections:
+        - "Original"
+        - "niconicoボーカロイド"
+        - "POPSアニメ"
+        - "東方Project"
+        - "DX Chart"
+        - "maimai DX CiRCLE"
+      temperature: 0.8
+      top_k: 50
+      bpm_override: 0.0
+      density: 0.0
+      empty_penalty_start: 32
+      empty_penalty_per_frame: 0.08
+      tap_bias: 0.0
+      hold_bias: 0.0
+      slide_bias: 0.0
+      wifi_bias: 0.0
+      touch_bias: 0.0
+      touchhold_bias: 0.0
+      break_bias: 0.0
+      filter_multi_tap: true
+      allow_touch: false
+      beat_method: "librosa"
+      skip_stages:
+        - "Stage 5"
+      memory_mode: "per_stage"
+
   designer: "AI"
   collections:
     - "Original"
     - "niconicoボーカロイド"
     - "POPSアニメ"
-    - "翠楼屋"
+    - "東方Project"
     - "DX Chart"
     - "maimai DX CiRCLE"
+
+  # 全局默认参数（未被难度覆盖时使用）
   bpm_override: 0
   density: 0.0
   tap_bias: 0.0
@@ -167,15 +379,16 @@ batch_infer:
   top_k: 50
   filter_multi_tap: true
   allow_touch: false
-  # per_stage: lowest VRAM; per_chart: balanced; per_file: fastest for multi-difficulty files
+  # per_stage: 最省显存；per_chart: 平衡；per_file: 多难度文件最快
   memory_mode: "per_stage"
   beat_method: "librosa"
   skip_stages:
     - "Stage 5"
+
   copy_audio: true
   audio_format: "mp3"
   audio_bitrate: "192k"
   copy_video: true
   extract_bg: true
   bg_max_size: 512
-  skip_existing: false
+  skip_existing: true

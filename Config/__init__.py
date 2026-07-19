@@ -165,6 +165,48 @@ class GenerationConfig:
     num_beams: int = 1
 
 
+def _default_batch_difficulty_presets() -> list[dict]:
+    common = {
+        "designer": "AI",
+        "collections": [
+            "Original",
+            "niconicoボーカロイド",
+            "POPSアニメ",
+            "翠楼屋",
+            "DX Chart",
+            "maimai DX CiRCLE",
+        ],
+        "temperature": 0.8,
+        "top_k": 50,
+        "bpm_override": 0.0,
+        "density": 0.0,
+        "empty_penalty_start": 32,
+        "empty_penalty_per_frame": 0.08,
+        "tap_bias": 0.0,
+        "hold_bias": 0.0,
+        "slide_bias": 0.0,
+        "wifi_bias": 0.0,
+        "touch_bias": 0.0,
+        "touchhold_bias": 0.0,
+        "break_bias": 0.0,
+        "filter_multi_tap": True,
+        "allow_touch": False,
+        "beat_method": "librosa",
+        "skip_stages": ["Stage 5"],
+        "memory_mode": "per_stage",
+    }
+    presets = [
+        ("Easy", 3.0),
+        ("Basic", 6.0),
+        ("Advanced", 9.0),
+        ("Expert", 12.0),
+        ("Master", 13.5),
+        ("Re:Master", 14.5),
+        ("UTAGE", 13.0),
+    ]
+    return [{"name": name, "level": level, **common} for name, level in presets]
+
+
 @dataclass
 class BatchInferConfig:
     """批量推理配置
@@ -191,9 +233,7 @@ class BatchInferConfig:
 
     # ── 难度列表 (每项为 dict: {name, level, 可选覆盖参数...}) ──
     # 兼容旧格式: 纯字符串列表自动转为 {"name": str, "level": ...}
-    difficulties: list = field(default_factory=lambda: [
-        {"name": "Master", "level": 13.0}
-    ])
+    difficulties: list = field(default_factory=_default_batch_difficulty_presets)
 
     # ── 标签 ──
     designer: str = "AI"
