@@ -410,8 +410,9 @@ def process_one_file(
         "break_bias": bi.break_bias,
         "filter_multi_tap": bi.filter_multi_tap,
         "allow_touch": bi.allow_touch,
-        "skip_stages": _normalize_skip_stages(bi.skip_stages),
+        "designer": bi.designer,
         "collections": bi.collections,
+        "skip_stages": _normalize_skip_stages(bi.skip_stages),
         "memory_mode": getattr(bi, "memory_mode", "per_stage"),
     }
 
@@ -420,7 +421,8 @@ def process_one_file(
         "density", "empty_penalty_start", "empty_penalty_per_frame",
         "tap_bias", "hold_bias", "slide_bias", "wifi_bias",
         "touch_bias", "touchhold_bias", "break_bias",
-        "filter_multi_tap", "allow_touch", "beat_method", "skip_stages",
+        "filter_multi_tap", "allow_touch", "designer", "collections",
+        "beat_method", "skip_stages",
         "memory_mode",
     ]
 
@@ -475,8 +477,8 @@ def process_one_file(
                 mp3_path=str(actual_audio_path),
                 difficulty=diff_name,
                 level=level,
-                designer=designer,
-                collections=diff_gen.get("collections", []),
+                designer=diff_gen.get("designer", designer),
+                collections=diff_gen.get("collections", bi.collections),
                 temperature=diff_gen.get("temperature", 0.8),
                 top_k=diff_gen.get("top_k", 50),
                 bpm_override=diff_gen.get("bpm_override", 0),
