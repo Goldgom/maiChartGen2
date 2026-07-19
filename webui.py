@@ -504,6 +504,12 @@ def _validate_slide_path(start_pos: str, path_str: str) -> bool:
         return False  # 1-1[...], 5-5[...] 这类直线同点无效
 
     # 相邻检查: |a-b| == 1 或 == 7 (环形)
+    if connector in ("w", "s", "z"):
+        diff = abs(start - target)
+        diff = min(diff, 8 - diff)
+        if diff != 3:
+            return False
+        return True
     diff = abs(start - target)
     if diff == 1 or diff == 7:
         return False  # 相邻, 无效
