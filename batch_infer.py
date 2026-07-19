@@ -399,6 +399,8 @@ def process_one_file(
         "top_k": getattr(bi, "top_k", gen.top_k),
         "bpm_override": bi.bpm_override,
         "density": bi.density,
+        "empty_penalty_start": getattr(gen, "empty_penalty_start", 32),
+        "empty_penalty_per_frame": getattr(gen, "empty_penalty_per_frame", 0.08),
         "tap_bias": bi.tap_bias,
         "hold_bias": bi.hold_bias,
         "slide_bias": bi.slide_bias,
@@ -415,7 +417,8 @@ def process_one_file(
 
     _OVERRIDABLE_KEYS = [
         "temperature", "top_k", "bpm_override",
-        "density", "tap_bias", "hold_bias", "slide_bias", "wifi_bias",
+        "density", "empty_penalty_start", "empty_penalty_per_frame",
+        "tap_bias", "hold_bias", "slide_bias", "wifi_bias",
         "touch_bias", "touchhold_bias", "break_bias",
         "filter_multi_tap", "allow_touch", "beat_method", "skip_stages",
         "memory_mode",
@@ -478,6 +481,8 @@ def process_one_file(
                 top_k=diff_gen.get("top_k", 50),
                 bpm_override=diff_gen.get("bpm_override", 0),
                 density=diff_gen.get("density", 0.0),
+                empty_penalty_start=diff_gen.get("empty_penalty_start", 32),
+                empty_penalty_per_frame=diff_gen.get("empty_penalty_per_frame", 0.08),
                 tap_bias=diff_gen.get("tap_bias", 0.0),
                 hold_bias=diff_gen.get("hold_bias", 0.0),
                 slide_bias=diff_gen.get("slide_bias", 0.0),

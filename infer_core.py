@@ -173,6 +173,10 @@ class InferenceEngine:
             int(v) for k, v in self.slide_vocab.items()
             if k not in ("<PAD>", "<EOS>") and _is_wifi_slide_vocab_token(k)
         }
+        continuation_slide_ids = {
+            int(v) for k, v in self.slide_vocab.items()
+            if k not in ("<PAD>", "<EOS>") and _is_slide_continuation_vocab_token(k)
+        }
 
         self.bias_empty = torch.zeros(vocab_size, dtype=torch.float32)
         self.bias_empty[self.empty_id] = 1.0
@@ -188,7 +192,12 @@ class InferenceEngine:
         )
         for i in wifi_ids:
             self.bias_wifi_slide[i] = 1.0
+        self.bias_continuation_slide = torch.zeros_like(self.bias_wifi_slide)
+        for i in continuation_slide_ids:
+            if 0 <= i < self.bias_continuation_slide.shape[0]:
+                self.bias_continuation_slide[i] = 1.0
         print(f"Loaded wifi slide paths: {len(wifi_ids)}")
+        print(f"Masked continuation slide paths: {len(continuation_slide_ids)}")
 
     # ═══════════════════════════════════════════════════════════
     # 模型管理
@@ -404,6 +413,41 @@ class InferenceEngine:
             logits = logits.masked_fill(touch_mask.view(1, 1, -1), float("-inf"))
         return logits
 
+    def _apply_stage1_empty_run_penalty(
+        self,
+        logits: torch.Tensor,
+        generated: torch.Tensor,
+        frame_idx: int,
+        empty_penalty_start: int,
+        empty_penalty_per_frame: float,
+    ) -> torch.Tensor:
+        """Penalize empty tokens after a long consecutive empty run."""
+        if empty_penalty_start < 0 or empty_penalty_per_frame <= 0:
+            return logits
+        if frame_idx <= 0:
+            return logits
+
+        empty_id = int(self.empty_id)
+        if empty_id < 0 or empty_id >= logits.shape[-1]:
+            return logits
+
+        empty_logits = logits.clone()
+        for batch_idx in range(generated.shape[0]):
+            empty_run = 0
+            for prev_frame in range(frame_idx - 1, -1, -1):
+                tid = int(generated[batch_idx, prev_frame].item())
+                if tid != empty_id:
+                    break
+                empty_run += 1
+
+            if empty_run < empty_penalty_start:
+                continue
+
+            penalty = float(empty_run - empty_penalty_start + 1) * float(empty_penalty_per_frame)
+            empty_logits[batch_idx, :, empty_id] -= penalty
+
+        return empty_logits
+
     def _apply_stage1_constraints(
         self,
         logits: torch.Tensor,
@@ -486,6 +530,8 @@ class InferenceEngine:
     # ═══════════════════════════════════════════════════════════
 
     def _validate_slide_path(self, start_pos: str, path_str: str) -> bool:
+        if path_str.startswith("*"):
+            return False
         try:
             start = int(start_pos)
         except ValueError:
@@ -527,6 +573,8 @@ class InferenceEngine:
         top_k: int,
         bpm_override: float,
         density: float,
+        empty_penalty_start: int,
+        empty_penalty_per_frame: float,
         tap_bias: float,
         hold_bias: float,
         slide_bias: float,
@@ -662,16 +710,22 @@ class InferenceEngine:
             max_history=int(getattr(cfg.generation, "stage1_history_frames", 512)),
             use_kv_cache=bool(getattr(cfg.generation, "stage1_use_kv_cache", True)),
             logits_processor=lambda logits, t, generated: self._apply_stage1_constraints(
-                self._apply_stage1_bias(
-                    logits,
-                    density,
-                    tap_bias,
-                    hold_bias,
-                    slide_bias,
-                    touch_bias,
-                    touchhold_bias,
-                    filter_multi_tap,
-                    allow_touch=allow_touch,
+                self._apply_stage1_empty_run_penalty(
+                    self._apply_stage1_bias(
+                        logits,
+                        density,
+                        tap_bias,
+                        hold_bias,
+                        slide_bias,
+                        touch_bias,
+                        touchhold_bias,
+                        filter_multi_tap,
+                        allow_touch=allow_touch,
+                    ),
+                    generated,
+                    t,
+                    empty_penalty_start,
+                    empty_penalty_per_frame,
                 ),
                 t,
                 generated,
@@ -728,6 +782,10 @@ class InferenceEngine:
                 sl = slide_logits.clone()
             if wifi_bias:
                 sl = sl + self._mask_like_logits(self.bias_wifi_slide, sl).view(1, 1, -1) * wifi_bias
+            sl = sl.masked_fill(
+                self._mask_like_logits(self.bias_continuation_slide, sl).view(1, 1, -1).bool(),
+                float("-inf"),
+            )
 
             # 屏蔽非法 slide 路径
             chart_np_for_slide = chart[0].detach().cpu().numpy()
@@ -847,7 +905,7 @@ class InferenceEngine:
                         seg = self.slide_vocab_inv.get(pid, "")
                         if seg and seg not in ("<PAD>", "<EOS>"):
                             path, timing = _slide_vocab_token_to_params(seg)
-                            if self._validate_slide_path(st.position, path):
+                            if not _is_slide_continuation_vocab_token(seg) and self._validate_slide_path(st.position, path):
                                 st.params["path"] = path
                                 if timing:
                                     st.params["dur"] = timing
@@ -957,6 +1015,8 @@ class InferenceEngine:
         top_k: int,
         bpm_override: float,
         density: float,
+        empty_penalty_start: int,
+        empty_penalty_per_frame: float,
         tap_bias: float,
         hold_bias: float,
         slide_bias: float,
@@ -1035,16 +1095,22 @@ class InferenceEngine:
             max_history=int(getattr(cfg.generation, "stage1_history_frames", 512)),
             use_kv_cache=bool(getattr(cfg.generation, "stage1_use_kv_cache", True)),
             logits_processor=lambda logits, t, generated: self._apply_stage1_constraints(
-                self._apply_stage1_bias(
-                    logits,
-                    density,
-                    tap_bias,
-                    hold_bias,
-                    slide_bias,
-                    touch_bias,
-                    touchhold_bias,
-                    filter_multi_tap,
-                    allow_touch=allow_touch,
+                self._apply_stage1_empty_run_penalty(
+                    self._apply_stage1_bias(
+                        logits,
+                        density,
+                        tap_bias,
+                        hold_bias,
+                        slide_bias,
+                        touch_bias,
+                        touchhold_bias,
+                        filter_multi_tap,
+                        allow_touch=allow_touch,
+                    ),
+                    generated,
+                    t,
+                    empty_penalty_start,
+                    empty_penalty_per_frame,
                 ),
                 t,
                 generated,
@@ -1089,6 +1155,10 @@ class InferenceEngine:
             sl = slide_logits / max(slide_temp, 0.01) if slide_temp > 0 else slide_logits.clone()
             if wifi_bias:
                 sl = sl + self._mask_like_logits(self.bias_wifi_slide, sl).view(1, 1, -1) * wifi_bias
+            sl = sl.masked_fill(
+                self._mask_like_logits(self.bias_continuation_slide, sl).view(1, 1, -1).bool(),
+                float("-inf"),
+            )
             # 非法路径屏蔽
             chart_np_for_slide = chart[0].detach().cpu().numpy()
             invalid_cache: dict[str, list[int]] = {}
@@ -1187,7 +1257,7 @@ class InferenceEngine:
                         seg = self.slide_vocab_inv.get(pid, "")
                         if seg and seg not in ("<PAD>", "<EOS>"):
                             path, timing = _slide_vocab_token_to_params(seg)
-                            if self._validate_slide_path(st.position, path):
+                            if not _is_slide_continuation_vocab_token(seg) and self._validate_slide_path(st.position, path):
                                 st.params["path"] = path
                                 if timing:
                                     st.params["dur"] = timing
@@ -1284,6 +1354,11 @@ def _has_touch_note(token_str: str) -> bool:
 def _is_wifi_slide_vocab_token(token: str) -> bool:
     path = re.sub(r"\[[^\]]+\]$", "", token)
     return re.search(r"(^|\*)w[1-8]", path) is not None
+
+
+def _is_slide_continuation_vocab_token(token: str) -> bool:
+    path = re.sub(r"\[[^\]]+\]$", "", token)
+    return path.startswith("*")
 
 
 def _output_grid_index(frame_idx: int, frame_rate: float,

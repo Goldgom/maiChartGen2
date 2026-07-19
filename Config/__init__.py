@@ -156,6 +156,8 @@ class GenerationConfig:
     top_k: int = 50
     stage1_use_kv_cache: bool = True
     stage1_history_frames: int = 256
+    empty_penalty_start: int = 32
+    empty_penalty_per_frame: float = 0.08
     top_p: float = 0.95
     repetition_penalty: float = 1.1
     max_new_tokens: int = 4096
@@ -350,6 +352,10 @@ class Config:
             errors.append("temperature 必须 > 0")
         if self.generation.top_p < 0 or self.generation.top_p > 1.0:
             errors.append("top_p 必须在 [0, 1] 之间")
+        if self.generation.empty_penalty_start < 0:
+            errors.append("empty_penalty_start 必须 >= 0")
+        if self.generation.empty_penalty_per_frame < 0:
+            errors.append("empty_penalty_per_frame 必须 >= 0")
 
         return errors
 
