@@ -534,6 +534,26 @@ generation:
     :range: ">= 0"
     :value: 50
 
+  stage1_use_kv_cache:
+    :description: "Stage 1 推理时使用 KV cache"
+    :range: "true | false"
+    :value: true
+
+  stage1_history_frames:
+    :description: "Stage 1 推理时保留的历史帧数"
+    :range: ">= 0"
+    :value: 256
+
+  empty_penalty_start:
+    :description: "连续 empty 多少帧后开始惩罚"
+    :range: ">= 0"
+    :value: 32
+
+  empty_penalty_per_frame:
+    :description: "超过阈值后每帧额外扣除的 empty logit"
+    :range: ">= 0"
+    :value: 0.08
+
   top_p:
     :description: "Nucleus 采样阈值 (1.0 表示不限制)"
     :range: "0.0 ~ 1.0"

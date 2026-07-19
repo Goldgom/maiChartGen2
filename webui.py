@@ -83,9 +83,18 @@ def _is_wifi_slide_vocab_token(token: str) -> bool:
     return re.search(r"(^|\*)w[1-8]", path) is not None
 
 
+def _is_slide_continuation_vocab_token(token: str) -> bool:
+    path = re.sub(r"\[[^\]]+\]$", "", token)
+    return path.startswith("*")
+
+
 _WIFI_SLIDE_IDS = {
     int(v) for k, v in SLIDE_VOCAB.items()
     if k not in ("<PAD>", "<EOS>") and _is_wifi_slide_vocab_token(k)
+}
+_CONTINUATION_SLIDE_IDS = {
+    int(v) for k, v in SLIDE_VOCAB.items()
+    if k not in ("<PAD>", "<EOS>") and _is_slide_continuation_vocab_token(k)
 }
 
 # 加载 path → best_timing 映射 (从训练数据统计)
@@ -181,7 +190,9 @@ BIAS_TOUCH_MASK = _build_mask(_TOUCH_IDS, VOCAB_SIZE)
 BIAS_TOUCHHOLD_MASK = _build_mask(_TOUCHHOLD_IDS, VOCAB_SIZE)
 BIAS_MULTI_TAP_MASK = _build_mask(_MULTI_TAP_IDS, VOCAB_SIZE)
 BIAS_WIFI_SLIDE_MASK = _build_mask(_WIFI_SLIDE_IDS, max(SLIDE_VOCAB_INV.keys(), default=0) + 1)
+BIAS_CONTINUATION_SLIDE_MASK = _build_mask(_CONTINUATION_SLIDE_IDS, max(SLIDE_VOCAB_INV.keys(), default=0) + 1)
 print(f"Loaded wifi slide paths: {len(_WIFI_SLIDE_IDS)}")
+print(f"Masked continuation slide paths: {len(_CONTINUATION_SLIDE_IDS)}")
 
 
 def _mask_like_logits(mask: torch.Tensor, logits: torch.Tensor) -> torch.Tensor:
@@ -381,6 +392,34 @@ def _apply_stage1_bias(
     return logits
 
 
+def _apply_stage1_empty_run_penalty(
+    logits: torch.Tensor,
+    generated: torch.Tensor,
+    frame_idx: int,
+    empty_penalty_start: int,
+    empty_penalty_per_frame: float,
+) -> torch.Tensor:
+    """Penalize empty token after a long consecutive empty run."""
+    if empty_penalty_start < 0 or empty_penalty_per_frame <= 0 or frame_idx <= 0:
+        return logits
+    if EMPTY_ID < 0 or EMPTY_ID >= logits.shape[-1]:
+        return logits
+
+    masked = logits.clone()
+    for batch_idx in range(generated.shape[0]):
+        empty_run = 0
+        for prev_frame in range(frame_idx - 1, -1, -1):
+            if int(generated[batch_idx, prev_frame].item()) != EMPTY_ID:
+                break
+            empty_run += 1
+        if empty_run < empty_penalty_start:
+            continue
+        masked[batch_idx, :, EMPTY_ID] -= (
+            float(empty_run - empty_penalty_start + 1) * float(empty_penalty_per_frame)
+        )
+    return masked
+
+
 def _apply_stage1_constraints(
     logits: torch.Tensor,
     frame_idx: int,
@@ -449,6 +488,8 @@ def _slide_first_target(path_str: str) -> tuple[str, int] | None:
 
 def _validate_slide_path(start_pos: str, path_str: str) -> bool:
     """检查 slide 路径是否合法 (不产生相邻位置/直线同点)"""
+    if path_str.startswith("*"):
+        return False
     try:
         start = int(start_pos)
     except ValueError:
@@ -528,6 +569,8 @@ def generate_chart(
     top_k: int,
     bpm_override: float,
     density: float,
+    empty_penalty_start: int,
+    empty_penalty_per_frame: float,
     tap_bias: float,
     hold_bias: float,
     slide_bias: float,
@@ -622,15 +665,21 @@ def generate_chart(
         temperature=temperature,
         top_k=top_k,
         logits_processor=lambda logits, t, generated: _apply_stage1_constraints(
-            _apply_stage1_bias(
-                logits,
-                density,
-                tap_bias,
-                hold_bias,
-                slide_bias,
-                touch_bias,
-                touchhold_bias,
-                filter_multi_tap,
+            _apply_stage1_empty_run_penalty(
+                _apply_stage1_bias(
+                    logits,
+                    density,
+                    tap_bias,
+                    hold_bias,
+                    slide_bias,
+                    touch_bias,
+                    touchhold_bias,
+                    filter_multi_tap,
+                ),
+                generated,
+                t,
+                empty_penalty_start,
+                empty_penalty_per_frame,
             ),
             t,
             generated,
@@ -688,6 +737,10 @@ def generate_chart(
             sl = slide_logits.clone()
         if wifi_bias:
             sl = sl + _mask_like_logits(BIAS_WIFI_SLIDE_MASK, sl).view(1, 1, -1) * wifi_bias
+        sl = sl.masked_fill(
+            _mask_like_logits(BIAS_CONTINUATION_SLIDE_MASK, sl).view(1, 1, -1).bool(),
+            float("-inf"),
+        )
 
         # Mask slide vocab entries that cannot legally attach to the predicted
         # Stage1 slide start position, e.g. slide1 + -1[8:1] -> 1-1[8:1].
@@ -792,7 +845,7 @@ def generate_chart(
                     seg = SLIDE_VOCAB_INV.get(pid, "")
                     if seg and seg not in ("<PAD>", "<EOS>"):
                         path, timing = _slide_vocab_token_to_params(seg)
-                        if _validate_slide_path(st.position, path):
+                        if not _is_slide_continuation_vocab_token(seg) and _validate_slide_path(st.position, path):
                             st.params["path"] = path
                             if timing:
                                 st.params["dur"] = timing
@@ -969,6 +1022,19 @@ def build_ui():
                     label="📊 整体密度 (Density)",
                 )
                 with gr.Row():
+                    empty_penalty_start = gr.Slider(
+                        minimum=0, maximum=256,
+                        value=getattr(cfg.generation, "empty_penalty_start", 32),
+                        step=1,
+                        label="连续空惩罚起点",
+                    )
+                    empty_penalty_per_frame = gr.Slider(
+                        minimum=0.0, maximum=1.0,
+                        value=getattr(cfg.generation, "empty_penalty_per_frame", 0.08),
+                        step=0.01,
+                        label="连续空每帧惩罚",
+                    )
+                with gr.Row():
                     tap_bias = gr.Slider(
                         minimum=-5.0, maximum=5.0, value=0.0, step=0.01,
                         label="👆 Tap",
@@ -1046,7 +1112,7 @@ def build_ui():
 
         # ── 事件绑定 ──
         def on_generate(audio_file, diff, lvl, des, cols, temp, topk, bpm_ov,
-                        dens, tb, hb, sb, wb, ttb, thb, bb, fmt, skips):
+                        dens, ep_start, ep_step, tb, hb, sb, wb, ttb, thb, bb, fmt, skips):
             if audio_file is None:
                 return "", "❌ 请先上传 MP3 文件！", gr.DownloadButton(visible=False)
 
@@ -1054,7 +1120,7 @@ def build_ui():
             try:
                 simai_text, info = generate_chart(
                     mp3_path, diff, lvl, des, cols, temp, topk, bpm_ov,
-                    dens, tb, hb, sb, wb, ttb, thb, bb, fmt, skips,
+                    dens, ep_start, ep_step, tb, hb, sb, wb, ttb, thb, bb, fmt, skips,
                 )
                 # 写入文件供下载
                 out_file = OUTPUT_DIR / "generated.txt"
@@ -1069,7 +1135,8 @@ def build_ui():
             on_generate,
             inputs=[audio_input, difficulty, level, designer, collection,
                     temperature, top_k, bpm_override,
-                    density, tap_bias, hold_bias, slide_bias, wifi_bias, touch_bias,
+                    density, empty_penalty_start, empty_penalty_per_frame,
+                    tap_bias, hold_bias, slide_bias, wifi_bias, touch_bias,
                     touchhold_bias, break_bias, filter_multi_tap, skip_stages],
             outputs=[simai_output, status_output, download_btn],
         )

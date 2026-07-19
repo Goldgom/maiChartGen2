@@ -447,7 +447,7 @@ def _token_to_simai_note(t: SimaiToken) -> str:
         path = t.params.get("path", "")
         dur = t.params.get("dur", "")
         timing = f"[{dur}]" if dur else ""
-        return f"{t.position}{flags}{path}{timing}"
+        return f"{t.position}{path}{flags}{timing}"
 
     if t.token_type == SimaiTokenType.TOUCH:
         # 合并的 touch → 拆回 each: "B3B4" → "B3/B4"

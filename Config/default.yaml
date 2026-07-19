@@ -124,6 +124,8 @@ generation:
   top_k: 50
   stage1_use_kv_cache: true
   stage1_history_frames: 256
+  empty_penalty_start: 32
+  empty_penalty_per_frame: 0.08
   top_p: 0.95
   repetition_penalty: 1.1
   max_new_tokens: 4096
