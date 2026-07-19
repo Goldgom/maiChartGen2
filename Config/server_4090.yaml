@@ -147,6 +147,8 @@ logging:
 generation:
   temperature: 0.8
   top_k: 50
+  stage1_use_kv_cache: true
+  stage1_history_frames: 256
   top_p: 0.95
 
 # ---- 批量推理 ----
@@ -259,6 +261,8 @@ batch_infer:
   top_k: 100
   filter_multi_tap: true
   allow_touch: true
+  # per_stage: lowest VRAM; per_chart: balanced; per_file: fastest for multi-difficulty files
+  memory_mode: "per_file"
   beat_method: "librosa"
   skip_stages:
     - "Stage 5"

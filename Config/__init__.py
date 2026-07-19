@@ -154,6 +154,8 @@ class LoggingConfig:
 class GenerationConfig:
     temperature: float = 0.8
     top_k: int = 50
+    stage1_use_kv_cache: bool = True
+    stage1_history_frames: int = 256
     top_p: float = 0.95
     repetition_penalty: float = 1.1
     max_new_tokens: int = 4096
@@ -215,6 +217,7 @@ class BatchInferConfig:
     break_bias: float = 0.0
     filter_multi_tap: bool = True
     allow_touch: bool = False
+    memory_mode: str = "per_stage"
     beat_method: str = "librosa"
     skip_stages: list[str] = field(default_factory=lambda: ["Stage 5"])
 

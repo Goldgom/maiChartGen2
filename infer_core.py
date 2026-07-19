@@ -97,6 +97,7 @@ class InferenceEngine:
 
         # ── 模型缓存 ──
         self._models_cache: dict = {}
+        self._model_state_cache: dict = {}
         self._audio_tokenizer = None
 
     # ═══════════════════════════════════════════════════════════
@@ -212,20 +213,28 @@ class InferenceEngine:
         if stage in self._models_cache:
             return self._models_cache[stage]
 
-        candidates = [
-            Path(self.ckpt_dir) / f"stage{stage}_last.pt",
-            Path(self.ckpt_dir) / f"stage{stage}_best.pt",
-            Path(self.data_dir) / f"stage{stage}_last.pt",
-            Path(self.data_dir) / f"stage{stage}_best.pt",
-            Path(self.data_dir) / f"stage{stage}.pt",
-        ]
-        ckpt_path = next((p for p in candidates if p.exists()), None)
-        if ckpt_path is None:
-            raise FileNotFoundError(f"Stage {stage} checkpoint not found")
+        cached_state = self._model_state_cache.get(stage)
+        if cached_state is None:
+            candidates = [
+                Path(self.ckpt_dir) / f"stage{stage}_last.pt",
+                Path(self.ckpt_dir) / f"stage{stage}_best.pt",
+                Path(self.data_dir) / f"stage{stage}_last.pt",
+                Path(self.data_dir) / f"stage{stage}_best.pt",
+                Path(self.data_dir) / f"stage{stage}.pt",
+            ]
+            ckpt_path = next((p for p in candidates if p.exists()), None)
+            if ckpt_path is None:
+                raise FileNotFoundError(f"Stage {stage} checkpoint not found")
 
-        ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-        model_cfg = ckpt.get("config", ckpt.get("cfg"))
-        state = ckpt.get("model_state_dict", ckpt.get("model"))
+            ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+            cached_state = (
+                ckpt.get("config", ckpt.get("cfg")),
+                ckpt.get("model_state_dict", ckpt.get("model")),
+            )
+            self._model_state_cache[stage] = cached_state
+            del ckpt
+
+        model_cfg, state = cached_state
 
         model_classes = {
             1: Stage1ChartModel, 2: Stage2HoldModel, 3: Stage3SlideModel,
@@ -233,7 +242,6 @@ class InferenceEngine:
         }
         model = model_classes[stage](model_cfg).to(self.device).eval()
         self._load_compatible_state(model, state)
-        del ckpt, state
         gc.collect()
         self._models_cache[stage] = model
         return model
@@ -651,6 +659,8 @@ class InferenceEngine:
             audio, beat, diff_t, lvl_t, tags_t,
             temperature=temperature,
             top_k=top_k,
+            max_history=int(getattr(cfg.generation, "stage1_history_frames", 512)),
+            use_kv_cache=bool(getattr(cfg.generation, "stage1_use_kv_cache", True)),
             logits_processor=lambda logits, t, generated: self._apply_stage1_constraints(
                 self._apply_stage1_bias(
                     logits,
@@ -1022,6 +1032,8 @@ class InferenceEngine:
             audio, beat, diff_t, lvl_t, tags_t,
             temperature=temperature,
             top_k=top_k,
+            max_history=int(getattr(cfg.generation, "stage1_history_frames", 512)),
+            use_kv_cache=bool(getattr(cfg.generation, "stage1_use_kv_cache", True)),
             logits_processor=lambda logits, t, generated: self._apply_stage1_constraints(
                 self._apply_stage1_bias(
                     logits,
