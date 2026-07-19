@@ -16,6 +16,7 @@ infer_core.py — maiChartGen3 共享推理引擎
 
 from __future__ import annotations
 
+import gc
 import json
 import re
 import sys
@@ -222,7 +223,7 @@ class InferenceEngine:
         if ckpt_path is None:
             raise FileNotFoundError(f"Stage {stage} checkpoint not found")
 
-        ckpt = torch.load(ckpt_path, map_location=self.device, weights_only=False)
+        ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
         model_cfg = ckpt.get("config", ckpt.get("cfg"))
         state = ckpt.get("model_state_dict", ckpt.get("model"))
 
@@ -232,8 +233,24 @@ class InferenceEngine:
         }
         model = model_classes[stage](model_cfg).to(self.device).eval()
         self._load_compatible_state(model, state)
+        del ckpt, state
+        gc.collect()
         self._models_cache[stage] = model
         return model
+
+    def release_model(self, stage: int | None = None) -> None:
+        """Release cached model weights from GPU memory."""
+        if stage is None:
+            self._models_cache.clear()
+        else:
+            self._models_cache.pop(stage, None)
+        gc.collect()
+        if self.device == "cuda" and torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    def _release_model_after_stage(self, stage: int, enabled: bool) -> None:
+        if enabled:
+            self.release_model(stage)
 
     def _get_audio_tokenizer(self):
         """延迟加载 EnCodec (保持 CPU 上)。"""
@@ -514,6 +531,7 @@ class InferenceEngine:
         audio_ctx: AudioContext | None = None,
         allow_touch: bool = True,
         verbose: bool = True,
+        release_models_after_stage: bool = False,
     ) -> tuple[str, str]:
         """
         核心推理函数，返回 (simai文本, 状态信息)。
@@ -653,6 +671,8 @@ class InferenceEngine:
                 filter_multi_tap,
             ),
         )
+        del m1
+        self._release_model_after_stage(1, release_models_after_stage)
         T = chart.shape[1]
         filtered_multi_tap_tokens = 0
         filtered_multi_tap_count = 0
@@ -675,6 +695,8 @@ class InferenceEngine:
             dur_pred = m2.generate(chart, audio, beat, diff_t, lvl_t, tags_t, hold_mask,
                                    temperature=temperature)
             hold_durs = _as_slot_array(dur_pred[0].cpu().numpy(), T)
+            del m2, hold_mask, dur_pred
+            self._release_model_after_stage(2, release_models_after_stage)
 
         # ── Stage 3: Slide 路径 ──
         if "Stage 3" in skip_stages:
@@ -729,9 +751,12 @@ class InferenceEngine:
             probs = F.softmax(sl, dim=-1)
             flat_probs = probs.reshape(-1, sl.shape[-1])
             slide_paths = torch.multinomial(flat_probs, 1).reshape(T, S).cpu().numpy()
+            del m3, out3, slide_logits, sl, probs, flat_probs
+            if "topk_vals" in locals():
+                del topk_vals
+            self._release_model_after_stage(3, release_models_after_stage)
 
         # ── Stage 4/5: Break / Ex ──
-        note_mask = (chart > 0).bool()
         if "Stage 4" in skip_stages:
             break_pred = np.zeros((T, 1), dtype=bool)
         else:
@@ -745,6 +770,8 @@ class InferenceEngine:
             break_pred = _as_slot_array(
                 break_logits.argmax(dim=-1)[0].cpu().numpy(), T,
             ).astype(bool)
+            del m4, break_logits
+            self._release_model_after_stage(4, release_models_after_stage)
 
         if "Stage 5" in skip_stages:
             ex_pred = np.zeros_like(break_pred, dtype=bool)
@@ -752,14 +779,20 @@ class InferenceEngine:
             if verbose:
                 print("[infer] Stage 5: Ex...")
             m5 = self.load_model(5)
+            ex_raw = m5.predict(chart, audio, beat, diff_t, lvl_t, tags_t)
             ex_pred = _as_slot_array(
-                m5.predict(chart, audio, beat, diff_t, lvl_t, tags_t)[0].cpu().numpy(), T,
+                ex_raw[0].cpu().numpy(), T,
             ).astype(bool)
+            del m5, ex_raw
+            self._release_model_after_stage(5, release_models_after_stage)
 
         # ── 构建 simai ──
         if verbose:
             print("[infer] 构建 simai 谱面...")
         chart_np = chart[0].cpu().numpy()
+        del audio, beat, diff_t, lvl_t, tags_t, chart
+        if self.device == "cuda" and torch.cuda.is_available():
+            torch.cuda.empty_cache()
         measures: dict[int, dict[int, list[str]]] = defaultdict(lambda: defaultdict(list))
 
         note_count = 0
@@ -925,6 +958,7 @@ class InferenceEngine:
         skip_stages: list[str] | None = None,
         audio_ctx: AudioContext | None = None,
         allow_touch: bool = True,
+        release_models_after_stage: bool = False,
     ) -> tuple[str, float, int] | None:
         """
         批量推理版本: 返回 (simai_body, bpm, note_count)，不含头部元数据。
@@ -1008,6 +1042,8 @@ class InferenceEngine:
                 filter_multi_tap,
             ),
         )
+        del m1
+        self._release_model_after_stage(1, release_models_after_stage)
         T = chart.shape[1]
         if filter_multi_tap:
             chart, _, _ = self._filter_multi_tap_chart(chart, fr, measure_dur, subdiv)
@@ -1025,6 +1061,8 @@ class InferenceEngine:
             dur_pred = m2.generate(chart, audio, beat, diff_t, lvl_t, tags_t, hold_mask,
                                    temperature=temperature)
             hold_durs = _as_slot_array(dur_pred[0].cpu().numpy(), T)
+            del m2, hold_mask, dur_pred
+            self._release_model_after_stage(2, release_models_after_stage)
 
         # ── Stage 3: Slide ──
         if "Stage 3" in skip_stages:
@@ -1068,6 +1106,10 @@ class InferenceEngine:
                                  torch.full_like(sl, float("-inf")), sl)
             probs = F.softmax(sl, dim=-1)
             slide_paths = torch.multinomial(probs.reshape(-1, sl.shape[-1]), 1).reshape(T, S).cpu().numpy()
+            del m3, out3, slide_logits, sl, probs
+            if "topk_vals" in locals():
+                del topk_vals
+            self._release_model_after_stage(3, release_models_after_stage)
 
         # ── Stage 4: Break ──
         if "Stage 4" in skip_stages:
@@ -1079,18 +1121,26 @@ class InferenceEngine:
                 bl = bl.clone()
                 bl[..., 1] += break_bias
             break_pred = _as_slot_array(bl.argmax(dim=-1)[0].cpu().numpy(), T).astype(bool)
+            del m4, bl
+            self._release_model_after_stage(4, release_models_after_stage)
 
         # ── Stage 5: Ex ──
         if "Stage 5" in skip_stages:
             ex_pred = np.zeros_like(break_pred, dtype=bool)
         else:
             m5 = self.load_model(5)
+            ex_raw = m5.predict(chart, audio, beat, diff_t, lvl_t, tags_t)
             ex_pred = _as_slot_array(
-                m5.predict(chart, audio, beat, diff_t, lvl_t, tags_t)[0].cpu().numpy(), T,
+                ex_raw[0].cpu().numpy(), T,
             ).astype(bool)
+            del m5, ex_raw
+            self._release_model_after_stage(5, release_models_after_stage)
 
         # ── 构建 simai body ──
         chart_np = chart[0].cpu().numpy()
+        del audio, beat, diff_t, lvl_t, tags_t, chart
+        if self.device == "cuda" and torch.cuda.is_available():
+            torch.cuda.empty_cache()
         measures: dict[int, dict[int, list[str]]] = defaultdict(lambda: defaultdict(list))
         note_count = 0
 

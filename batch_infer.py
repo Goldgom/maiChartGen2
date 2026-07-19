@@ -483,6 +483,7 @@ def process_one_file(
                 skip_stages=diff_gen.get("skip_stages", []),
                 audio_ctx=audio_ctx,
                 allow_touch=diff_gen.get("allow_touch", True),
+                release_models_after_stage=True,
             )
 
             if result is None:
@@ -499,6 +500,10 @@ def process_one_file(
             traceback.print_exc()
             _clear_gpu_cache(engine.device)
             continue
+        finally:
+            if hasattr(engine, "release_model"):
+                engine.release_model()
+            _clear_gpu_cache(engine.device)
 
     if not diff_results:
         logger.error(f"  所有难度推理均失败: {title}")
