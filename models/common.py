@@ -129,6 +129,8 @@ class FastAHPE(nn.Module):
             if key not in self._cache:
                 with torch.no_grad():
                     self._cache[key] = self._compute_train(T).detach()
+                while len(self._cache) > 8:
+                    self._cache.pop(next(iter(self._cache)))
             pe = self._cache[key]
         return x + self.scale * pe.unsqueeze(0)
 

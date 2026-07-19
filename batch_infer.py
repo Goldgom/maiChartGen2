@@ -410,6 +410,7 @@ def process_one_file(
         "allow_touch": bi.allow_touch,
         "skip_stages": _normalize_skip_stages(bi.skip_stages),
         "collections": bi.collections,
+        "memory_mode": getattr(bi, "memory_mode", "per_stage"),
     }
 
     _OVERRIDABLE_KEYS = [
@@ -417,6 +418,7 @@ def process_one_file(
         "density", "tap_bias", "hold_bias", "slide_bias", "wifi_bias",
         "touch_bias", "touchhold_bias", "break_bias",
         "filter_multi_tap", "allow_touch", "beat_method", "skip_stages",
+        "memory_mode",
     ]
 
     for i, diff_info in enumerate(normalized_diffs):
@@ -442,6 +444,10 @@ def process_one_file(
             logger.info(f"  [{i+1}/{len(normalized_diffs)}] {diff_name} Lv.{level} ({overrides_str})")
         else:
             logger.info(f"  [{i+1}/{len(normalized_diffs)}] {diff_name} Lv.{level}")
+
+        memory_mode = str(diff_gen.get("memory_mode", "per_stage")).lower()
+        release_after_stage = memory_mode in {"per_stage", "stage", "low", "low_memory"}
+        release_after_chart = memory_mode not in {"per_file", "file", "keep"}
 
         try:
             # 预计算音频上下文 (缓存复用)
@@ -483,7 +489,7 @@ def process_one_file(
                 skip_stages=diff_gen.get("skip_stages", []),
                 audio_ctx=audio_ctx,
                 allow_touch=diff_gen.get("allow_touch", True),
-                release_models_after_stage=True,
+                release_models_after_stage=release_after_stage,
             )
 
             if result is None:
@@ -501,13 +507,15 @@ def process_one_file(
             _clear_gpu_cache(engine.device)
             continue
         finally:
-            if hasattr(engine, "release_model"):
+            if release_after_chart and hasattr(engine, "release_model"):
                 engine.release_model()
             _clear_gpu_cache(engine.device)
 
     if not diff_results:
         logger.error(f"  所有难度推理均失败: {title}")
         audio_context_cache.clear()
+        if hasattr(engine, "release_model"):
+            engine.release_model()
         _clear_gpu_cache(engine.device)
         return False
 
@@ -524,6 +532,8 @@ def process_one_file(
     logger.info(f"  输出目录: {output_dir}")
 
     audio_context_cache.clear()
+    if hasattr(engine, "release_model"):
+        engine.release_model()
     _clear_gpu_cache(engine.device)
     return True
 
