@@ -542,6 +542,12 @@ class InferenceEngine:
         connector, target = first
         if connector == "-" and target == start:
             return False
+        if connector in ("w", "s", "z"):
+            diff = abs(start - target)
+            diff = min(diff, 8 - diff)
+            if diff != 3:
+                return False
+            return True
         diff = abs(start - target)
         if diff == 1 or diff == 7:
             return False
